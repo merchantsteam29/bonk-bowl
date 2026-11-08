@@ -6,7 +6,14 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem('bonkbowl.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { try { localStorage.setItem('bonkbowl.' + k, JSON.stringify(v)); } catch {} },
 };
-const settings = { controllers: store.get('controllers', true), target: store.get('target', 5) };
+const settings = { controllers: store.get('controllers', true), target: store.get('target', 5), map: store.get('map', 'meadow'), cpu: store.get('cpu', 'easy') };
+// CPU difficulty: how often they rethink, how keen they are to dash, dash range, how hard they push the stick
+const CPU = {
+  easy:   { label: 'Easy',   think: 0.4,  aggr: 0.8, range: 2.4, push: 0.7 },
+  normal: { label: 'Normal', think: 0.2,  aggr: 1.8, range: 3.0, push: 0.85 },
+  hard:   { label: 'Hard',   think: 0.1,  aggr: 3.4, range: 3.6, push: 1 },
+};
+if (!CPU[settings.cpu]) settings.cpu = 'easy';
 
 const SLOTS = [
   { name: 'RED',  color: 0xff4d5e, css: '#ff4d5e', hint: 'Move W A S D<br>Dash Q',
@@ -122,10 +129,11 @@ scene.background = new THREE.Color(0x1d1840);
 scene.fog = new THREE.Fog(0x1d1840, 34, 80);
 const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 200);
 const camBase = new THREE.Vector3(0, 19, 15.5);
+let mapScale = 1; // bigger maps pull the camera back
 function resize() {
   renderer.setSize(innerWidth, innerHeight);
   camera.aspect = innerWidth / innerHeight;
-  const far = camera.aspect < 1.2 ? 1.2 / camera.aspect : 1; // portrait / narrow screens pull back
+  const far = (camera.aspect < 1.2 ? 1.2 / camera.aspect : 1) * mapScale; // portrait / narrow screens pull back
   camBase.set(0, 19 * far, 15.5 * far);
   camera.updateProjectionMatrix();
 }
@@ -160,24 +168,67 @@ const rocks = [];
   }
 }
 
-// ---------------- arena (hex tiles) ----------------
-const S = 1.15, N = 4, SQ3 = Math.sqrt(3);
-const tiles = [], tileMap = new Map();
+// ---------------- maps ----------------
+const S = 1.15, SQ3 = Math.sqrt(3);
+const HEX_DIRS = [[1, 0], [1, -1], [0, -1], [-1, 0], [-1, 1], [0, 1]];
+const hexDist = (q, r) => Math.max(Math.abs(q), Math.abs(r), Math.abs(q + r));
+const hexToWorld = (q, r) => ({ x: S * SQ3 * (q + r / 2), z: S * 1.5 * r });
+function hexArea(cq, cr, rad, into) {
+  for (let q = -rad; q <= rad; q++) for (let r = -rad; r <= rad; r++) if (hexDist(q, r) <= rad) into.add((cq + q) + ',' + (cr + r));
+  return into;
+}
+const ISLE_DIRS = [[1, -1], [-1, 0], [0, 1]];
+const MAPS = {
+  meadow: { name: 'Meadow Bowl', desc: 'The classic. One big round field.', bg: 0x1d1840, side: 0x7a5640, tops: [0x84dca8, 0x9be8b8, 0xc6f5d2],
+    cells: () => hexArea(0, 0, 4, new Set()) },
+  donut: { name: 'Donut Dunes', desc: 'A ring of sand with a hole in the middle.', bg: 0x2a1530, side: 0x9a6a3a, tops: [0xf0c987, 0xf7d9a0, 0xf7d9a0],
+    cells: () => { const s = hexArea(0, 0, 5, new Set()); for (const k of hexArea(0, 0, 1, new Set())) s.delete(k); return s; }, spawnR: 6.6 },
+  isles: { name: 'Three Isles', desc: 'Everyone starts on their own island. Bridges meet in the middle.', bg: 0x14243a, side: 0x6b5a48, tops: [0xe8a35a, 0xf2bd78, 0xffe0a8],
+    cells: () => { const s = hexArea(0, 0, 1, new Set()); for (const [dq, dr] of ISLE_DIRS) { hexArea(dq * 5, dr * 5, 2, s); s.add(dq * 2 + ',' + dr * 2); } return s; },
+    spawns: () => ISLE_DIRS.map(([dq, dr]) => hexToWorld(dq * 5, dr * 5)) },
+  bumper: { name: 'Bumper Park', desc: 'Bouncy posts fling you across the field.', bg: 0x2b1438, side: 0x8a4a78, tops: [0xff9ccf, 0xffb8dc, 0xffe0f0],
+    cells: () => hexArea(0, 0, 4, new Set()), bumpers: [[2, 0], [-2, 0], [0, 2], [0, -2], [2, -2], [-2, 2]] },
+  ice: { name: 'Frozen Pond', desc: 'Slippery ice. Hard to stop!', bg: 0x101c33, side: 0x7d9ab8, tops: [0xbfe6ff, 0xd8f1ff, 0xf0faff], ice: true,
+    cells: () => hexArea(0, 0, 4, new Set()) },
+};
+const MAP_IDS = Object.keys(MAPS);
+let MAP = MAPS.meadow, mapId = 'meadow';
+const tiles = [], tileMap = new Map(), bumpers = [];
 const sideMat = new THREE.MeshStandardMaterial({ color: 0x7a5640, roughness: 0.95, flatShading: true });
 const botMat = new THREE.MeshStandardMaterial({ color: 0x3f2c26, roughness: 1, flatShading: true });
 const tileGeo = new THREE.CylinderGeometry(S * 0.965, S * 0.7, 1.1, 6, 1);
 tileGeo.translate(0, -0.55, 0);
-for (let q = -N; q <= N; q++) for (let r = -N; r <= N; r++) {
-  const ring = Math.max(Math.abs(q), Math.abs(r), Math.abs(q + r));
-  if (ring > N) continue;
-  const base = new THREE.Color(ring === 0 ? 0xc6f5d2 : ring % 2 ? 0x84dca8 : 0x9be8b8);
-  const top = new THREE.MeshStandardMaterial({ color: base.clone(), roughness: 0.8, flatShading: true });
-  const mesh = new THREE.Mesh(tileGeo, [sideMat, top, botMat]);
-  const x = S * SQ3 * (q + r / 2), z = S * 1.5 * r;
-  mesh.position.set(x, 0, z); mesh.receiveShadow = true; mesh.castShadow = true;
-  scene.add(mesh);
-  const t = { q, r, ring, x, z, mesh, top, base, state: 'ok', t: 0, vy: 0, spin: new THREE.Vector3() };
-  tiles.push(t); tileMap.set(q + ',' + r, t);
+const bumperGeo = new THREE.CylinderGeometry(0.45, 0.52, 0.8, 24); bumperGeo.translate(0, 0.4, 0);
+const bumperMat = new THREE.MeshStandardMaterial({ color: 0xff3d9a, emissive: 0xff3d9a, emissiveIntensity: 0.35, roughness: 0.3 });
+const bumperCapGeo = new THREE.SphereGeometry(0.42, 20, 10, 0, Math.PI * 2, 0, Math.PI / 2); bumperCapGeo.translate(0, 0.8, 0);
+const bumperCapMat = new THREE.MeshStandardMaterial({ color: 0xfff0f8, roughness: 0.25 });
+function buildArena(id) {
+  mapId = id; MAP = MAPS[id];
+  for (const t of tiles) { scene.remove(t.mesh); t.top.dispose(); }
+  tiles.length = 0; tileMap.clear(); bumpers.length = 0;
+  sideMat.color.setHex(MAP.side);
+  scene.background.setHex(MAP.bg); scene.fog.color.setHex(MAP.bg);
+  const bset = new Set((MAP.bumpers || []).map(([q, r]) => q + ',' + r));
+  let ext = 0;
+  for (const key of MAP.cells()) {
+    const [q, r] = key.split(',').map(Number), ring = hexDist(q, r), { x, z } = hexToWorld(q, r);
+    const base = new THREE.Color(MAP.tops[ring === 0 ? 2 : ring % 2]);
+    const top = new THREE.MeshStandardMaterial({ color: base.clone(), roughness: MAP.ice ? 0.12 : 0.8, metalness: MAP.ice ? 0.15 : 0, flatShading: true });
+    const mesh = new THREE.Mesh(tileGeo, [sideMat, top, botMat]);
+    mesh.position.set(x, 0, z); mesh.receiveShadow = true; mesh.castShadow = true;
+    scene.add(mesh);
+    const t = { q, r, ring, x, z, mesh, top, base, state: 'ok', t: 0, vy: 0, spin: new THREE.Vector3(), bumper: null, bump: 0 };
+    if (bset.has(key)) {
+      const b = new THREE.Group(), post = new THREE.Mesh(bumperGeo, bumperMat), cap = new THREE.Mesh(bumperCapGeo, bumperCapMat);
+      post.castShadow = true; b.add(post, cap); mesh.add(b); t.bumper = b; bumpers.push(t);
+    }
+    tiles.push(t); tileMap.set(key, t);
+    ext = Math.max(ext, Math.hypot(x, z) + S);
+  }
+  mapScale = Math.max(1, ext / 9.2);
+  Object.assign(sun.shadow.camera, { left: -ext - 2, right: ext + 2, top: ext + 2, bottom: -ext - 2 });
+  sun.shadow.camera.updateProjectionMatrix();
+  resize();
 }
 function tileAt(x, z) {
   const fq = (SQ3 / 3 * x - z / 3) / S, fr = (2 / 3 * z) / S, fs = -fq - fr;
@@ -186,7 +237,14 @@ function tileAt(x, z) {
   if (dq > dr && dq > ds) rq = -rr - rs; else if (dr > ds) rr = -rq - rs;
   return tileMap.get(rq + ',' + rr) || null;
 }
-const supported = (x, z) => { const t = tileAt(x, z); return !!t && t.state !== 'gone'; };
+const solid = (x, z) => { const t = tileAt(x, z); return !!t && t.state !== 'gone'; };
+// A small lip: you only fall once your middle is clearly past the edge.
+const LIP = 0.34;
+function supported(x, z) {
+  if (solid(x, z)) return true;
+  for (let k = 0; k < 6; k++) { const a = k * Math.PI / 3; if (solid(x + Math.cos(a) * LIP, z + Math.sin(a) * LIP)) return true; }
+  return false;
+}
 function resetTiles() {
   for (const t of tiles) {
     t.state = 'ok'; t.t = 0; t.vy = 0;
@@ -200,6 +258,18 @@ function updateCentroid() {
   for (const t of tiles) if (t.state === 'ok') { sx += t.x; sz += t.z; n++; }
   centroid = n ? { x: sx / n, z: sz / n } : { x: 0, z: 0 };
   return n;
+}
+// Nearby tile with lots of solid neighbours: where bots run to when in danger.
+function safeSpot(p) {
+  let best = null, bs = 1e9;
+  for (const t of tiles) {
+    if (t.state !== 'ok' || t.bumper) continue;
+    let nb = 0;
+    for (const [dq, dr] of HEX_DIRS) { const n = tileMap.get((t.q + dq) + ',' + (t.r + dr)); if (n && n.state === 'ok') nb++; }
+    const s = Math.hypot(t.x - p.x, t.z - p.z) - nb * 0.8;
+    if (s < bs) { bs = s; best = t; }
+  }
+  return best ? { x: best.x, z: best.z } : { ...centroid };
 }
 
 // ---------------- particles & effects ----------------
@@ -252,14 +322,15 @@ function createPlayers() {
   SLOTS.forEach((s, i) => {
     if (slotState[i] === 'empty') return;
     players.push({ i, slot: s, cpu: slotState[i] === 'cpu', g: makeBlob(s.color), score: 0, kos: 0,
-      ai: { think: 0, goal: { x: 0, z: 0 }, target: null, dist: 99, aggr: 2.5 + Math.random() * 1.5 } });
+      ai: { think: 0, goal: { x: 0, z: 0 }, safe: { x: 0, z: 0 }, target: null, dist: 99, aggr: 0.8 + Math.random() * 0.4 } });
   });
 }
 function placePlayers() {
-  const n = players.length;
+  const n = players.length, spots = MAP.spawns ? MAP.spawns() : null, R = MAP.spawnR || 3.6;
   players.forEach((p, k) => {
     const a = Math.PI / 2 + (k / n) * Math.PI * 2;
-    Object.assign(p, { x: Math.cos(a) * 3.6, z: Math.sin(a) * 3.6, y: 0, vx: 0, vz: 0, vy: 0, alive: true, falling: false,
+    const at = spots ? spots[k % spots.length] : { x: Math.cos(a) * R, z: Math.sin(a) * R };
+    Object.assign(p, { x: at.x, z: at.z, y: 0, vx: 0, vz: 0, vy: 0, alive: true, falling: false,
       dashCd: 0, dashT: 0, hitT: 0, mega: 0, zoom: 0, scale: 1, sq: 0, lastHit: null });
     p.face = Math.atan2(-p.x, -p.z);
     p.g.root.visible = true; p.g.ring.visible = true;
@@ -276,7 +347,7 @@ let pickups = [], pickTimer = 5;
 function clearPickups() { for (const k of pickups) scene.remove(k.mesh); pickups = []; pickTimer = 5 + Math.random() * 2; }
 function spawnPickup() {
   const okRing = Math.max(0, ...tiles.filter((t) => t.state === 'ok').map((t) => t.ring)) - 1;
-  const cands = tiles.filter((t) => t.state === 'ok' && t.ring <= okRing && players.every((p) => !p.alive || Math.hypot(p.x - t.x, p.z - t.z) > 1.8));
+  const cands = tiles.filter((t) => t.state === 'ok' && !t.bumper && t.ring <= okRing && players.every((p) => !p.alive || Math.hypot(p.x - t.x, p.z - t.z) > 1.8));
   if (!cands.length) return;
   const t = cands[(Math.random() * cands.length) | 0];
   const types = Object.keys(PICK), type = types[(Math.random() * types.length) | 0];
@@ -330,6 +401,9 @@ function renderLobby() {
   }).join('');
   document.querySelectorAll('[data-target]').forEach((b) => b.classList.toggle('sel', +b.dataset.target === settings.target));
   $('ctrlToggle').textContent = 'Controllers: ' + (settings.controllers ? 'ON' : 'OFF');
+  $('maps').innerHTML = [...MAP_IDS, 'random'].map((id) => `<button data-map="${id}" class="${settings.map === id ? 'sel' : ''}">${id === 'random' ? '🎲 Random' : MAPS[id].name}</button>`).join('');
+  $('mapDesc').textContent = settings.map === 'random' ? 'A different map every round.' : MAPS[settings.map].desc;
+  $('cpuLevel').innerHTML = Object.keys(CPU).map((id) => `<button data-cpu="${id}" class="${settings.cpu === id ? 'sel' : ''}">${CPU[id].label}</button>`).join('');
   $('startBtn').disabled = slotState.filter((s) => s !== 'empty').length < 2;
 }
 $('cards').addEventListener('click', (e) => {
@@ -344,6 +418,16 @@ $('ctrlToggle').addEventListener('click', () => {
   settings.controllers = !settings.controllers; store.set('controllers', settings.controllers);
   if (!settings.controllers) for (const st of pads.values()) if (st.slot >= 0) { slotState[st.slot] = 'empty'; st.slot = -1; }
   renderLobby();
+});
+$('maps').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-map]'); if (!b) return;
+  settings.map = b.dataset.map; store.set('map', settings.map);
+  if (settings.map !== 'random') buildArena(settings.map);
+  renderLobby();
+});
+$('cpuLevel').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-cpu]'); if (!b) return;
+  settings.cpu = b.dataset.cpu; store.set('cpu', settings.cpu); renderLobby();
 });
 $('startBtn').addEventListener('click', () => tryStart());
 $('resumeBtn').addEventListener('click', () => setPaused(false));
@@ -372,7 +456,7 @@ function toLobby() {
   state = 'lobby'; setPaused(false);
   show('lobby', true); show('end', false); show('hud', false); show('help', false); $('big').textContent = '';
   for (const p of players) { scene.remove(p.g.root); scene.remove(p.g.ring); }
-  players = []; resetTiles(); clearPickups(); renderLobby();
+  players = []; buildArena(settings.map === 'random' ? mapId : settings.map); clearPickups(); renderLobby();
 }
 function startMatch() {
   createPlayers();
@@ -380,8 +464,13 @@ function startMatch() {
   startRound();
 }
 function startRound() {
+  if (settings.map === 'random') {
+    const pick = MAP_IDS.filter((id) => id !== mapId);
+    buildArena(pick[(Math.random() * pick.length) | 0]);
+    feed(`Map: <b>${MAP.name}</b>`);
+  } else if (mapId !== settings.map) buildArena(settings.map);
   resetTiles(); clearPickups(); placePlayers();
-  roundTime = 0; endPending = -1; collapseT = 8;
+  roundTime = 0; endPending = -1; collapseT = 12;
   state = 'countdown'; stateT = 3; lastBeep = 4;
   renderHud();
 }
@@ -415,33 +504,36 @@ function showMatchEnd() {
 // ---------------- simulation ----------------
 const massOf = (p) => (p.mega > 0 ? 2.6 : 1);
 function botInput(p, dt) {
-  const ai = p.ai;
+  const ai = p.ai, lvl = CPU[settings.cpu];
   ai.think -= dt;
   if (ai.think <= 0) {
-    ai.think = 0.12 + Math.random() * 0.12;
+    ai.think = lvl.think * (0.7 + Math.random() * 0.6);
+    ai.safe = safeSpot(p);
     let best = null, bd = 1e9;
     for (const o of players) { if (o === p || !o.alive || o.falling) continue; const d = Math.hypot(o.x - p.x, o.z - p.z); if (d < bd) { bd = d; best = o; } }
     let pk = null, pd = 1e9;
     for (const k of pickups) { const d = Math.hypot(k.x - p.x, k.z - p.z); if (d < pd) { pd = d; pk = k; } }
     if (pk && (!best || pd < bd * 0.7)) ai.goal = { x: pk.x, z: pk.z };
-    else if (best) { // aim slightly on the centre side of the target so the hit pushes it outward
-      const cx = centroid.x - best.x, cz = centroid.z - best.z, cl = Math.hypot(cx, cz) || 1;
+    else if (best && settings.cpu !== 'easy') { // aim slightly on the safe side of the target so the hit pushes it outward
+      const cx = ai.safe.x - best.x, cz = ai.safe.z - best.z, cl = Math.hypot(cx, cz) || 1;
       ai.goal = { x: best.x + cx / cl * 0.5, z: best.z + cz / cl * 0.5 };
-    } else ai.goal = { ...centroid };
+    } else if (best) ai.goal = { x: best.x, z: best.z };
+    else ai.goal = { ...ai.safe };
     ai.target = best; ai.dist = bd;
   }
   let dx = ai.goal.x - p.x, dz = ai.goal.z - p.z, l = Math.hypot(dx, dz) || 1; dx /= l; dz /= l;
   const here = tileAt(p.x, p.z);
-  if (!supported(p.x + p.vx * 0.4 + dx * 0.7, p.z + p.vz * 0.4 + dz * 0.7) || (here && here.state === 'warn') || Math.hypot(p.vx, p.vz) > 9) {
-    dx = centroid.x - p.x; dz = centroid.z - p.z; l = Math.hypot(dx, dz) || 1; dx /= l; dz /= l;
+  const look = MAP.ice ? 1.0 : 0.4;
+  if (!solid(p.x + p.vx * look + dx * 0.7, p.z + p.vz * look + dz * 0.7) || (here && here.state === 'warn') || Math.hypot(p.vx, p.vz) > 9) {
+    dx = ai.safe.x - p.x; dz = ai.safe.z - p.z; l = Math.hypot(dx, dz) || 1; dx /= l; dz /= l;
     return { x: dx, y: dz, dash: false };
   }
   let dash = false;
-  if (ai.target && ai.dist < 3.2 && p.dashCd <= 0 && Math.random() < dt * ai.aggr) {
+  if (ai.target && ai.dist < lvl.range && p.dashCd <= 0 && Math.random() < dt * lvl.aggr * ai.aggr) {
     const tx = (ai.target.x - p.x) / ai.dist, tz = (ai.target.z - p.z) / ai.dist;
-    if (supported(p.x + tx * 2.4, p.z + tz * 2.4)) { dash = true; dx = tx; dz = tz; }
+    if (solid(p.x + tx * 2.4, p.z + tz * 2.4)) { dash = true; dx = tx; dz = tz; }
   }
-  return { x: dx, y: dz, dash };
+  return { x: dx * lvl.push, y: dz * lvl.push, dash };
 }
 
 function simulate(dt) {
@@ -456,21 +548,41 @@ function simulate(dt) {
       continue;
     }
     const inp = canMove ? (p.cpu ? botInput(p, dt) : slotInput(p.i)) : { x: 0, y: 0, dash: false };
-    const spd = p.zoom > 0 ? 1.45 : 1, acc = 24 * spd / (p.mega > 0 ? 1.2 : 1);
+    // grip: normal ground stops you fast (easy to control), ice barely does
+    const grip = MAP.ice ? 1.6 : 5, dashGrip = MAP.ice ? 0.8 : 1.1;
+    const spd = p.zoom > 0 ? 1.45 : 1, acc = (MAP.ice ? 17 : 36) * spd / (p.mega > 0 ? 1.2 : 1);
     p.vx += inp.x * acc * dt; p.vz += inp.y * acc * dt;
     if (inp.dash && p.dashCd <= 0) {
       let dx = inp.x, dz = inp.y, l = Math.hypot(dx, dz);
       if (l < 0.2) { dx = Math.sin(p.face); dz = Math.cos(p.face); l = 1; }
       p.vx += dx / l * 14 * spd; p.vz += dz / l * 14 * spd;
-      p.dashCd = p.zoom > 0 ? 0.45 : 0.95; p.dashT = 0.24; p.sq = 0.8;
+      p.dashCd = p.zoom > 0 ? 0.4 : 0.75; p.dashT = 0.24; p.sq = 0.8;
       sfx.dash(); burst(p.x, 0.2, p.z, 0xffffff, 6, 2.5);
     }
-    const fr = Math.exp(-(p.dashT > 0 ? 1.1 : 3.2) * dt); p.vx *= fr; p.vz *= fr;
+    const fr = Math.exp(-(p.dashT > 0 ? dashGrip : grip) * dt); p.vx *= fr; p.vz *= fr;
     p.x += p.vx * dt; p.z += p.vz * dt;
     const sp = Math.hypot(p.vx, p.vz);
     if (sp > 0.6) { let d = Math.atan2(p.vx, p.vz) - p.face; d = Math.atan2(Math.sin(d), Math.cos(d)); p.face += d * Math.min(1, 12 * dt); }
     const target = p.mega > 0 ? 1.6 : 1; p.scale += (target - p.scale) * Math.min(1, 8 * dt);
+    p.teeter = !solid(p.x, p.z);
     if (!supported(p.x, p.z)) { p.falling = true; p.vy = 2; sfx.fall(); p.g.ring.visible = false; }
+  }
+  // blob vs bumper posts
+  for (const t of bumpers) {
+    if (t.state === 'gone') continue;
+    for (const p of players) {
+      if (!p.alive || p.falling) continue;
+      const dx = p.x - t.x, dz = p.z - t.z, d = Math.hypot(dx, dz), rr = 0.47 + 0.55 * p.scale;
+      if (d >= rr || d < 1e-5) continue;
+      const nx = dx / d, nz = dz / d;
+      p.x = t.x + nx * rr; p.z = t.z + nz * rr;
+      const vn = p.vx * nx + p.vz * nz;
+      if (vn < 0) { p.vx -= 2 * vn * nx; p.vz -= 2 * vn * nz; }
+      const out = p.vx * nx + p.vz * nz, kick = Math.max(0, 11 - out);
+      p.vx += nx * kick; p.vz += nz * kick;
+      p.sq = 0.8; t.bump = 1;
+      tone(520, 0.18, 'sine', 0.2, 900); burst(t.x + nx * 0.5, 0.6, t.z + nz * 0.5, 0xff3d9a, 8, 4);
+    }
   }
   // blob vs blob
   for (let a = 0; a < players.length; a++) for (let b = a + 1; b < players.length; b++) {
@@ -483,9 +595,9 @@ function simulate(dt) {
     B.x += nx * ov * ma / (ma + mb); B.z += nz * ov * ma / (ma + mb);
     const rv = (B.vx - A.vx) * nx + (B.vz - A.vz) * nz;
     if (rv >= 0) continue;
-    const j = -2 * rv / (1 / ma + 1 / mb);
+    const j = -1.75 * rv / (1 / ma + 1 / mb);
     A.vx -= j / ma * nx; A.vz -= j / ma * nz; B.vx += j / mb * nx; B.vz += j / mb * nz;
-    const bonusB = A.dashT > 0 ? 7 * Math.sqrt(ma / mb) : 0, bonusA = B.dashT > 0 ? 7 * Math.sqrt(mb / ma) : 0;
+    const bonusB = A.dashT > 0 ? 5 * Math.sqrt(ma / mb) : 0, bonusA = B.dashT > 0 ? 5 * Math.sqrt(mb / ma) : 0;
     B.vx += nx * bonusB; B.vz += nz * bonusB; A.vx -= nx * bonusA; A.vz -= nz * bonusA;
     const str = -rv + bonusA + bonusB;
     A.lastHit = { by: B, t: clock }; B.lastHit = { by: A, t: clock };
@@ -511,7 +623,7 @@ function updateTiles(dt) {
     collapseT -= dt;
     const floor = roundTime > 75 ? 1 : 7;
     if (collapseT <= 0 && okCount > floor) {
-      collapseT = Math.max(0.4, 1.5 - (roundTime - 8) * 0.025);
+      collapseT = Math.max(0.6, 2.0 - (roundTime - 12) * 0.03);
       const ok = tiles.filter((t) => t.state === 'ok');
       const maxRing = Math.max(...ok.map((t) => t.ring));
       const pool = Math.random() < 0.75 ? ok.filter((t) => t.ring === maxRing) : ok.filter((t) => t.ring > 0);
@@ -528,7 +640,7 @@ function updateTiles(dt) {
       t.mesh.position.set(t.x + (Math.random() - 0.5) * 0.08, 0, t.z + (Math.random() - 0.5) * 0.08);
       if (t.t <= 0) {
         t.state = 'gone'; t.vy = 0; t.spin.set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(3);
-        sfx.crumble(); burst(t.x, -0.2, t.z, 0x7a5640, 8, 3);
+        sfx.crumble(); burst(t.x, -0.2, t.z, MAP.side, 8, 3);
       }
     } else if (t.state === 'gone' && t.mesh.visible) {
       t.vy -= 22 * dt; t.mesh.position.y += t.vy * dt;
@@ -547,12 +659,14 @@ function render(dt, time) {
     g.root.position.set(p.x, p.y + hop, p.z); g.root.rotation.y = p.face; g.root.scale.setScalar(p.scale);
     if (p.falling) g.root.rotation.x += dt * 6;
     else g.root.rotation.x = 0;
+    g.root.rotation.z = p.teeter && !p.falling ? Math.sin(time * 28) * 0.18 : 0; // wobble on the edge
     g.squash.scale.set(1 + p.sq * 0.3, 1 - p.sq * 0.32, 1 + p.sq * 0.3);
     g.mat.emissiveIntensity = p.zoom > 0 ? 0.35 + Math.sin(time * 18) * 0.25 : p.mega > 0 ? 0.25 : 0;
     g.crown.visible = top > 0 && p.score === top;
     g.ring.position.set(p.x, 0.03, p.z); g.ring.scale.setScalar(p.scale);
     g.ring.material.opacity = p.dashCd > 0 ? 0.25 : 0.9;
   }
+  for (const t of bumpers) { t.bump *= Math.exp(-10 * dt); t.bumper.scale.set(1 + t.bump * 0.35, 1 - t.bump * 0.3, 1 + t.bump * 0.35); }
   for (const k of pickups) { k.mesh.rotation.y += dt * 2.5; k.mesh.rotation.x += dt * 1.2; k.mesh.position.y = 0.75 + Math.sin(time * 3 + k.x) * 0.15; k.mesh.visible = !(k.t > 9 && Math.sin(time * 20) > 0); }
   for (const m of [...parts]) {
     const u = m.userData; u.life -= dt; u.v.y -= 14 * dt; m.position.addScaledVector(u.v, dt); m.scale.multiplyScalar(Math.exp(-2 * dt));
@@ -610,6 +724,8 @@ function frame(now) {
   pressed.clear();
   requestAnimationFrame(frame);
 }
+if (settings.map !== 'random' && !MAPS[settings.map]) settings.map = 'meadow';
+buildArena(settings.map === 'random' ? 'meadow' : settings.map);
 renderLobby();
 requestAnimationFrame(frame);
-if (location.search.includes('test')) window.__bb = { info: () => ({ state, roundTime: +roundTime.toFixed(1), gone: tiles.filter((t) => t.state === 'gone').length, scores: players.map((p) => p.score), alive: players.map((p) => p.alive) }) };
+if (location.search.includes('test')) window.__bb = { info: () => ({ map: mapId, state, roundTime: +roundTime.toFixed(1), gone: tiles.filter((t) => t.state === 'gone').length, scores: players.map((p) => p.score), alive: players.map((p) => p.alive) }) };

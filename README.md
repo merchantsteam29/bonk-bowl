@@ -14,3 +14,6 @@ Controllers work too (press A to join). Empty slots can be filled with CPU playe
 Pickups: **MEGA** (huge and heavy), **ZOOM** (fast, quick dashes), **QUAKE** (shockwave).
 
 Run locally: `node serve.js` then open http://localhost:8080
+
+**Maps:** Meadow Bowl, Donut Dunes (hole in the middle), Three Isles (islands joined by bridges), Bumper Park (bouncy posts), Frozen Pond (slippery ice), or Random every round.
+**CPU difficulty:** Easy, Normal or Hard.

@@ -12,9 +12,9 @@
     font-family: "Segoe UI", system-ui, sans-serif; user-select:none; }
   canvas { display:block; }
   .overlay { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
-    gap:14px; padding:16px; background:radial-gradient(ellipse at center, rgba(29,24,64,.55), rgba(10,8,26,.92)); text-align:center; }
+    gap:12px; padding:16px; overflow-y:auto; justify-content:safe center; background:radial-gradient(ellipse at center, rgba(29,24,64,.55), rgba(10,8,26,.92)); text-align:center; }
   .hidden { display:none !important; }
-  h1 { margin:0; font-size:clamp(42px, 9vw, 96px); letter-spacing:4px; font-weight:900;
+  h1 { margin:0; font-size:clamp(40px, 8vw, 84px); letter-spacing:4px; font-weight:900;
     background:linear-gradient(90deg,var(--red),var(--gold),var(--blue)); -webkit-background-clip:text; background-clip:text; color:transparent;
     filter:drop-shadow(0 6px 0 rgba(0,0,0,.35)); }
   .tag { margin:0; opacity:.85; font-size:18px; }
@@ -67,7 +67,11 @@
   <h1>BONK BOWL</h1>
   <p class="tag">Three blobs. One crumbling bowl. Dash into your friends and knock them off.</p>
   <div id="cards"></div>
+  <div class="row"><span>Map:</span><span id="maps" class="row"></span></div>
+  <div id="mapDesc" class="small" style="opacity:.8;margin-top:-6px"></div>
   <div class="row">
+    <span>CPU:</span><span id="cpuLevel" class="row"></span>
+    <span style="width:12px"></span>
     <span>Rounds to win:</span>
     <button data-target="3">3</button><button data-target="5">5</button><button data-target="7">7</button>
     <span style="width:12px"></span>
