@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bonk Bowl</title>
+<meta name="description" content="3-player party game on one keyboard. Dash into your friends and bonk them off a crumbling hex arena. Last blob standing wins.">
+<style>
+  :root { --red:#ff4d5e; --blue:#3fa9ff; --gold:#ffc62e; --ink:#fff; --panel:rgba(20,16,48,.82); }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; overflow:hidden; background:#1d1840; color:var(--ink);
+    font-family: "Segoe UI", system-ui, sans-serif; user-select:none; }
+  canvas { display:block; }
+  .overlay { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:14px; padding:16px; background:radial-gradient(ellipse at center, rgba(29,24,64,.55), rgba(10,8,26,.92)); text-align:center; }
+  .hidden { display:none !important; }
+  h1 { margin:0; font-size:clamp(42px, 9vw, 96px); letter-spacing:4px; font-weight:900;
+    background:linear-gradient(90deg,var(--red),var(--gold),var(--blue)); -webkit-background-clip:text; background-clip:text; color:transparent;
+    filter:drop-shadow(0 6px 0 rgba(0,0,0,.35)); }
+  .tag { margin:0; opacity:.85; font-size:18px; }
+  #cards { display:flex; gap:14px; flex-wrap:wrap; justify-content:center; }
+  .card { width:220px; padding:16px; border-radius:18px; background:var(--panel); border:3px solid rgba(255,255,255,.12); transition:transform .15s, border-color .15s; }
+  .card.on { border-color:var(--c); transform:translateY(-4px); box-shadow:0 0 24px color-mix(in srgb, var(--c) 45%, transparent); }
+  .card .blob { width:54px; height:54px; border-radius:50%; margin:0 auto 8px; background:var(--c); position:relative; box-shadow:inset -6px -8px 0 rgba(0,0,0,.18); }
+  .card .blob::before, .card .blob::after { content:""; position:absolute; top:16px; width:12px; height:14px; border-radius:50%; background:#fff; box-shadow:inset 0 -5px 0 2px #111; }
+  .card .blob::before { left:12px; } .card .blob::after { right:12px; }
+  .card .nm { font-weight:900; font-size:22px; color:var(--c); letter-spacing:2px; }
+  .card .keys { font-size:14px; opacity:.85; margin:6px 0; min-height:36px; }
+  .card .st { font-weight:800; font-size:16px; margin:8px 0; }
+  button { font:inherit; font-weight:800; color:#fff; background:#3a3170; border:none; border-radius:12px; padding:8px 14px; cursor:pointer; }
+  button:hover { background:#4c42904d; outline:2px solid #ffffff55; }
+  button.sel { background:#fff; color:#1d1840; }
+  #startBtn { font-size:22px; padding:12px 34px; background:linear-gradient(90deg,#ff4d5e,#ff8a3d); }
+  #startBtn:disabled { opacity:.4; cursor:default; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:center; }
+  .legend { display:flex; gap:18px; flex-wrap:wrap; justify-content:center; font-size:14px; opacity:.9; }
+  .legend span::before { content:""; display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:6px; background:var(--c); vertical-align:-1px; }
+  .small { font-size:13px; opacity:.6; margin:0; max-width:640px; }
+  #hud { position:fixed; top:12px; left:0; right:0; display:flex; justify-content:center; gap:12px; pointer-events:none; flex-wrap:wrap; padding:0 16px; }
+  .pill { background:var(--panel); border-radius:999px; padding:6px 14px; display:flex; align-items:center; gap:8px; border:2px solid var(--c); font-weight:900; }
+  .pill .n { color:var(--c); }
+  .pill.out { opacity:.4; }
+  .pip { width:12px; height:12px; border-radius:50%; border:2px solid var(--c); }
+  .pip.f { background:var(--c); }
+  #big { position:fixed; left:0; right:0; top:38%; text-align:center; font-size:clamp(48px, 10vw, 110px); font-weight:900; pointer-events:none;
+    text-shadow:0 6px 0 rgba(0,0,0,.35); transition:transform .12s; }
+  #big.pop { transform:scale(1.25); }
+  #feed { position:fixed; bottom:16px; left:16px; display:flex; flex-direction:column; gap:6px; pointer-events:none; }
+  #feed div { background:var(--panel); padding:6px 12px; border-radius:10px; font-weight:700; animation:fade 3.5s forwards; }
+  @keyframes fade { 0%,80% { opacity:1 } 100% { opacity:0 } }
+  #help { position:fixed; bottom:12px; right:16px; font-size:12px; opacity:.5; pointer-events:none; }
+  .stats { display:flex; gap:14px; flex-wrap:wrap; justify-content:center; }
+  .stats div { background:var(--panel); border-radius:14px; padding:10px 18px; border:2px solid var(--c); }
+  .stats b { color:var(--c); display:block; font-size:20px; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<div id="hud" class="hidden"></div>
+<div id="big"></div>
+<div id="feed"></div>
+<div id="help" class="hidden">Esc / Start = pause</div>
+
+<div id="lobby" class="overlay">
+  <h1>BONK BOWL</h1>
+  <p class="tag">Three blobs. One crumbling bowl. Dash into your friends and knock them off.</p>
+  <div id="cards"></div>
+  <div class="row">
+    <span>Rounds to win:</span>
+    <button data-target="3">3</button><button data-target="5">5</button><button data-target="7">7</button>
+    <span style="width:12px"></span>
+    <button id="ctrlToggle">Controllers: ON</button>
+  </div>
+  <button id="startBtn">START &nbsp;(Space)</button>
+  <div class="legend">
+    <span style="--c:#b26bff">MEGA: huge and heavy</span>
+    <span style="--c:#3ff0ff">ZOOM: fast, quick dashes</span>
+    <span style="--c:#ff8a3d">QUAKE: shockwave knocks everyone back</span>
+  </div>
+  <p class="small">Press your dash key to join. Click a card to add or remove a CPU. Some keyboards can't register lots of keys at once. If keys stop working, plug in a controller and press A.</p>
+</div>
+
+<div id="pause" class="overlay hidden">
+  <h1 style="font-size:64px">PAUSED</h1>
+  <div class="row"><button id="resumeBtn">Resume (Esc)</button><button id="quitBtn">Quit to lobby (Backspace)</button></div>
+</div>
+
+<div id="end" class="overlay hidden">
+  <h1 id="endTitle" style="font-size:72px">WINNER</h1>
+  <div class="stats" id="endStats"></div>
+  <div class="row"><button id="rematchBtn">Rematch (Space)</button><button id="lobbyBtn">Lobby (Esc)</button></div>
+</div>
+
+<script type="module" src="game.js"></script>
+</body>
+</html>
