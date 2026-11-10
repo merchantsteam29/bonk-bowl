@@ -1,0 +1,33 @@
+[
+  {
+    "version": "1.2",
+    "date": "2026-11-09",
+    "title": "Install as an app",
+    "notes": [
+      "Bonk Bowl can be installed as an app from the lobby (Install as an app), with its own icon. It opens fullscreen and works offline once it has loaded."
+    ]
+  },
+  {
+    "version": "1.1",
+    "date": "2026-11-08",
+    "title": "New maps, and easier to play",
+    "notes": [
+      "Four new maps: Donut Dunes, Three Isles, Bumper Park and Frozen Pond, plus Random each round.",
+      "Snappier movement with less sliding, softer knockback and a quicker dash recharge.",
+      "A small edge lip: you wobble on the edge before you fall.",
+      "The floor starts crumbling later and slower.",
+      "CPU difficulty: Easy, Normal or Hard (Easy by default)."
+    ]
+  },
+  {
+    "version": "1.0",
+    "date": "2026-11-08",
+    "title": "Release",
+    "notes": [
+      "Three blobs, one keyboard, one crumbling bowl: dash into your friends and knock them off.",
+      "CPU players fill any empty seats.",
+      "Pickups: MEGA, ZOOM and QUAKE.",
+      "First to 3, 5 or 7 rounds wins."
+    ]
+  }
+]
