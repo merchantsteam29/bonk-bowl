@@ -1,5 +1,6 @@
 // BONK BOWL: 3-player local sumo on one device.
 import * as THREE from 'three';
+import { createGovernor } from './perf.js';
 
 const $ = (id) => document.getElementById(id);
 const store = {
@@ -119,8 +120,10 @@ const sfx = {
 };
 
 // ---------------- scene ----------------
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+// perf.js trims the render resolution a little when frames run slow (and gives it back when they don't)
+const gov = createGovernor({ apply: (s) => renderer.setPixelRatio(Math.min(devicePixelRatio, 2) * s) });
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.prepend(renderer.domElement);
@@ -617,6 +620,7 @@ function simulate(dt) {
   }
 }
 
+const WARN_RED = new THREE.Color(0xff3b3b);
 function updateTiles(dt) {
   if (state === 'play') {
     const okCount = updateCentroid();
@@ -636,7 +640,7 @@ function updateTiles(dt) {
     if (t.state === 'warn') {
       t.t -= dt;
       const flash = (Math.sin(t.t * 30) + 1) / 2;
-      t.top.color.copy(t.base).lerp(new THREE.Color(0xff3b3b), 0.4 + flash * 0.5);
+      t.top.color.copy(t.base).lerp(WARN_RED, 0.4 + flash * 0.5);
       t.mesh.position.set(t.x + (Math.random() - 0.5) * 0.08, 0, t.z + (Math.random() - 0.5) * 0.08);
       if (t.t <= 0) {
         t.state = 'gone'; t.vy = 0; t.spin.set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(3);
@@ -650,6 +654,7 @@ function updateTiles(dt) {
   }
 }
 
+const camDrift = new THREE.Vector3();
 function render(dt, time) {
   const top = players.length ? Math.max(...players.map((p) => p.score)) : 0;
   for (const p of players) {
@@ -678,8 +683,9 @@ function render(dt, time) {
   }
   for (const r of rocks) { const u = r.userData; u.a += u.s * dt; r.position.set(Math.cos(u.a) * u.r, u.y + Math.sin(time + u.r) * 0.6, Math.sin(u.a) * u.r); r.rotation.y += dt * 0.2; }
   shake *= Math.exp(-6 * dt);
-  const drift = state === 'lobby' ? new THREE.Vector3(Math.sin(time * 0.15) * 6, 0, Math.cos(time * 0.15) * 4 - 2) : new THREE.Vector3();
-  camera.position.copy(camBase).add(drift).add(new THREE.Vector3((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake, 0));
+  if (state === 'lobby') camDrift.set(Math.sin(time * 0.15) * 6, 0, Math.cos(time * 0.15) * 4 - 2); else camDrift.set(0, 0, 0);
+  camera.position.copy(camBase).add(camDrift);
+  camera.position.x += (Math.random() - 0.5) * shake; camera.position.y += (Math.random() - 0.5) * shake;
   camera.lookAt(0, 0, 0.8);
   renderer.render(scene, camera);
 }
@@ -687,7 +693,8 @@ function render(dt, time) {
 // ---------------- main loop ----------------
 let last = performance.now();
 function frame(now) {
-  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  const raw = (now - last) / 1000, dt = Math.min(0.05, raw); last = now;
+  if (state !== 'lobby' && !paused) gov.tick(raw);
   pollPads();
   const escape = pressed.has('Escape') || anyPadPressed(9);
   if (state === 'lobby') lobbyInput();
