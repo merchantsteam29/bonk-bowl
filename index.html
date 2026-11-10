@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bonk Bowl</title>
+<link rel="icon" href="icons/icon.svg">
+<meta name="theme-color" content="#1d1840">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <meta name="description" content="3-player party game on one keyboard. Dash into your friends and bonk them off a crumbling hex arena. Last blob standing wins.">
 <style>
   :root { --red:#ff4d5e; --blue:#3fa9ff; --gold:#ffc62e; --ink:#fff; --panel:rgba(20,16,48,.82); }
@@ -78,6 +82,7 @@
     <button id="ctrlToggle">Controllers: ON</button>
   </div>
   <button id="startBtn">START &nbsp;(Space)</button>
+    <button id="installApp" style="display:none">Install as an app</button>
   <div class="legend">
     <span style="--c:#b26bff">MEGA: huge and heavy</span>
     <span style="--c:#3ff0ff">ZOOM: fast, quick dashes</span>
@@ -98,5 +103,6 @@
 </div>
 
 <script type="module" src="game.js"></script>
+<script src="install.js"></script>
 </body>
 </html>
