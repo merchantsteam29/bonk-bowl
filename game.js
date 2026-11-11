@@ -8,6 +8,9 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem('bonkbowl.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { try { localStorage.setItem('bonkbowl.' + k, JSON.stringify(v)); } catch {} },
 };
+// lifetime stats (for achievements and the Game Library profile)
+const stats = { matches: 0, wins: 0, bonkoffs: 0, online: 0, ...store.get('stats', {}) };
+const saveStats = () => store.set('stats', stats);
 const settings = { controllers: store.get('controllers', true), target: store.get('target', 5), map: store.get('map', 'meadow'), cpu: store.get('cpu', 'easy'),
   vol: store.get('vol', 0.8), shake: store.get('shake', 1), autoRes: store.get('autoRes', true) };
 // CPU difficulty: how often they rethink, how keen they are to dash, dash range, how hard they push the stick
@@ -209,6 +212,12 @@ const MAPS = {
     cells: () => hexArea(0, 0, 4, new Set()), bumpers: [[2, 0], [-2, 0], [0, 2], [0, -2], [2, -2], [-2, 2]] },
   ice: { name: 'Frozen Pond', desc: 'Slippery ice. Hard to stop!', bg: 0x101c33, side: 0x7d9ab8, tops: [0xbfe6ff, 0xd8f1ff, 0xf0faff], ice: true,
     cells: () => hexArea(0, 0, 4, new Set()) },
+  carousel: { name: 'Carousel', desc: 'The whole bowl turns. Stand still and it carries you to the edge.', bg: 0x1f1030, side: 0xb0603a, tops: [0xffb35a, 0xff7a8a, 0xfff0b0], spin: 0.32,
+    cells: () => { const s = hexArea(0, 0, 4, new Set()); for (const k of ['3,1', '-3,-1', '1,-4', '-1,4']) s.delete(k); return s; } },
+  factory: { name: 'Factory Floor', desc: 'Conveyor belts push you sideways. Use them to ram, or fight them.', bg: 0x14181f, side: 0x5a6068, tops: [0x9aa4b0, 0xb8c0ca, 0xd6dce2],
+    cells: () => hexArea(0, 0, 4, new Set()),
+    // rows of belts, alternating direction
+    belt: (q, r) => (r === -2 ? -1 : r === 0 ? 1 : r === 2 ? -1 : 0) },
 };
 const MAP_IDS = Object.keys(MAPS);
 let MAP = MAPS.meadow, mapId = 'meadow';
@@ -236,7 +245,8 @@ function buildArena(id) {
     const mesh = new THREE.Mesh(tileGeo, [sideMat, top, botMat]);
     mesh.position.set(x, 0, z); mesh.receiveShadow = true; mesh.castShadow = true;
     scene.add(mesh);
-    const t = { q, r, ring, x, z, mesh, top, base, state: 'ok', t: 0, vy: 0, spin: new THREE.Vector3(), bumper: null, bump: 0 };
+    const t = { q, r, ring, x, z, ax: x, az: z, mesh, top, base, state: 'ok', t: 0, vy: 0, spin: new THREE.Vector3(), bumper: null, bump: 0, belt: MAP.belt ? MAP.belt(q, r) : 0 };
+    if (t.belt) { base.lerp(new THREE.Color(0x3a4048), 0.55); top.color.copy(base); }
     if (bset.has(key)) {
       const b = new THREE.Group(), post = new THREE.Mesh(bumperGeo, bumperMat), cap = new THREE.Mesh(bumperCapGeo, bumperCapMat);
       post.castShadow = true; b.add(post, cap); mesh.add(b); t.bumper = b; bumpers.push(t);
@@ -244,12 +254,15 @@ function buildArena(id) {
     tiles.push(t); tileMap.set(key, t);
     ext = Math.max(ext, Math.hypot(x, z) + S);
   }
+  spinA = 0;
   mapScale = Math.max(1, ext / 9.2);
   Object.assign(sun.shadow.camera, { left: -ext - 2, right: ext + 2, top: ext + 2, bottom: -ext - 2 });
   sun.shadow.camera.updateProjectionMatrix();
   resize();
 }
+let spinA = 0; // how far the Carousel has turned
 function tileAt(x, z) {
+  if (spinA) { const c = Math.cos(-spinA), sn = Math.sin(-spinA), x2 = x * c - z * sn; z = x * sn + z * c; x = x2; }
   const fq = (SQ3 / 3 * x - z / 3) / S, fr = (2 / 3 * z) / S, fs = -fq - fr;
   let rq = Math.round(fq), rr = Math.round(fr); const rs = Math.round(fs);
   const dq = Math.abs(rq - fq), dr = Math.abs(rr - fr), ds = Math.abs(rs - fs);
@@ -265,7 +278,8 @@ function supported(x, z) {
   return false;
 }
 function resetTiles() {
-  for (const t of tiles) {
+  spinA = 0;
+  for (const t of tiles) { t.x = t.ax; t.z = t.az;
     t.state = 'ok'; t.t = 0; t.vy = 0;
     t.mesh.position.set(t.x, 0, t.z); t.mesh.rotation.set(0, 0, 0); t.mesh.visible = true;
     t.top.color.copy(t.base);
@@ -350,7 +364,7 @@ function placePlayers() {
     const a = Math.PI / 2 + (k / n) * Math.PI * 2;
     const at = spots ? spots[k % spots.length] : { x: Math.cos(a) * R, z: Math.sin(a) * R };
     Object.assign(p, { x: at.x, z: at.z, y: 0, vx: 0, vz: 0, vy: 0, alive: true, falling: false,
-      dashCd: 0, dashT: 0, hitT: 0, mega: 0, zoom: 0, scale: 1, sq: 0, lastHit: null });
+      dashCd: 0, dashT: 0, hitT: 0, mega: 0, zoom: 0, magnet: 0, slip: 0, scale: 1, sq: 0, lastHit: null });
     p.face = Math.atan2(-p.x, -p.z);
     p.g.root.visible = true; p.g.ring.visible = true;
   });
@@ -361,7 +375,17 @@ const PICK = {
   mega:  { color: 0xb26bff, geo: new THREE.BoxGeometry(0.55, 0.55, 0.55), label: 'MEGA' },
   zoom:  { color: 0x3ff0ff, geo: new THREE.OctahedronGeometry(0.42), label: 'ZOOM' },
   quake: { color: 0xff8a3d, geo: new THREE.TorusGeometry(0.3, 0.12, 10, 20), label: 'QUAKE' },
+  magnet: { color: 0xff3b5c, geo: new THREE.TorusGeometry(0.3, 0.11, 10, 20, Math.PI * 1.2), label: 'MAGNET' },
+  banana: { color: 0xffe14a, geo: new THREE.CapsuleGeometry(0.12, 0.42, 4, 10), label: 'BANANA' },
 };
+// banana peels on the floor: { x, z, owner, t, mesh }
+let peels = [];
+const peelGeo = new THREE.TorusGeometry(0.2, 0.07, 6, 12, Math.PI * 1.4), peelMat = new THREE.MeshStandardMaterial({ color: 0xffd23a, roughness: 0.5 });
+function dropPeel(x, z, owner) {
+  const mesh = new THREE.Mesh(peelGeo, peelMat); mesh.rotation.x = -Math.PI / 2; mesh.position.set(x, 0.62, z); scene.add(mesh);
+  peels.push({ x, z, owner, t: 0, mesh });
+}
+function clearPeels() { for (const b of peels) scene.remove(b.mesh); peels = []; }
 let pickups = [], pickTimer = 5;
 function clearPickups() { for (const k of pickups) scene.remove(k.mesh); pickups = []; pickTimer = 5 + Math.random() * 2; }
 function spawnPickup() {
@@ -378,6 +402,8 @@ function grab(p, k) {
   sfx.pickup(); burst(k.x, 0.7, k.z, PICK[k.type].color, 14, 5); emit('grab', k.type, +k.x.toFixed(2), +k.z.toFixed(2), p.i);
   feed(`<span style="color:${p.slot.css}">${p.slot.name}</span> got ${PICK[k.type].label}!`);
   if (k.type === 'mega') p.mega = 6;
+  if (k.type === 'magnet') p.magnet = 5;
+  if (k.type === 'banana') { const bx = p.x - Math.sin(p.face) * 1.3, bz = p.z - Math.cos(p.face) * 1.3; dropPeel(solid(bx, bz) ? bx : p.x, solid(bx, bz) ? bz : p.z, p); }
   if (k.type === 'zoom') { p.zoom = 6; p.dashCd = 0; }
   if (k.type === 'quake') {
     sfx.quake(); shake = 0.6; shockwave(p.x, p.z, PICK.quake.color);
@@ -527,7 +553,7 @@ function startRound() {
     buildArena(pick[(Math.random() * pick.length) | 0]);
     feed(`Map: <b>${MAP.name}</b>`);
   } else if (mapId !== settings.map) buildArena(settings.map);
-  resetTiles(); clearPickups(); placePlayers(); emit('round', mapId);
+  resetTiles(); clearPickups(); clearPeels(); placePlayers(); emit('round', mapId);
   roundTime = 0; endPending = -1; collapseT = 12;
   state = 'countdown'; stateT = 3; lastBeep = 4;
   renderHud();
@@ -559,6 +585,11 @@ function showMatchEnd() {
   $('endStats').innerHTML = players.map((p) => `<div style="--c:${p.slot.css}"><b>${who(p)}</b>${p.score} rounds · ${p.kos} bonk-offs</div>`).join('');
   sfx.win();
   emit('end', $('endTitle').textContent, w.slot.css, $('endStats').innerHTML);
+  // this browser's players: the local humans (and, for a friend online, their own slot)
+  const mine = players.filter((p) => !p.cpu && !p.net);
+  stats.matches++; if (mine.includes(w)) stats.wins++; stats.bonkoffs += mine.reduce((n, p) => n + p.kos, 0);
+  if (NET.hosting && NET.room.conns.size) stats.online++;
+  saveStats();
 }
 
 // ---------------- simulation ----------------
@@ -584,7 +615,8 @@ function botInput(p, dt) {
   let dx = ai.goal.x - p.x, dz = ai.goal.z - p.z, l = Math.hypot(dx, dz) || 1; dx /= l; dz /= l;
   const here = tileAt(p.x, p.z);
   const look = MAP.ice ? 1.0 : 0.4;
-  if (!solid(p.x + p.vx * look + dx * 0.7, p.z + p.vz * look + dz * 0.7) || (here && here.state === 'warn') || Math.hypot(p.vx, p.vz) > 9) {
+  const peelAhead = peels.some((b) => b.owner !== p && Math.hypot(b.x - (p.x + dx * 0.9), b.z - (p.z + dz * 0.9)) < 0.7);
+  if (!solid(p.x + p.vx * look + dx * 0.7, p.z + p.vz * look + dz * 0.7) || (here && here.state === 'warn') || Math.hypot(p.vx, p.vz) > 9 || peelAhead) {
     dx = ai.safe.x - p.x; dz = ai.safe.z - p.z; l = Math.hypot(dx, dz) || 1; dx /= l; dz /= l;
     return { x: dx, y: dz, dash: false };
   }
@@ -600,7 +632,12 @@ function simulate(dt) {
   const canMove = state === 'play' || state === 'roundEnd';
   for (const p of players) {
     if (!p.alive) continue;
-    p.dashCd -= dt; p.dashT -= dt; p.hitT -= dt; p.mega -= dt; p.zoom -= dt;
+    p.dashCd -= dt; p.dashT -= dt; p.hitT -= dt; p.mega -= dt; p.zoom -= dt; p.magnet = (p.magnet || 0) - dt;
+    if (p.magnet > 0 && !p.falling) for (const o of players) {
+      if (o === p || !o.alive || o.falling) continue;
+      const dx = p.x - o.x, dz = p.z - o.z, d = Math.hypot(dx, dz) || 1;
+      if (d < 9) { const f = 13 * (1 - d / 9) / massOf(o); o.vx += dx / d * f * dt; o.vz += dz / d * f * dt; }
+    }
     p.sq *= Math.exp(-8 * dt);
     if (p.falling) {
       p.vy -= 32 * dt; p.y += p.vy * dt; p.x += p.vx * dt; p.z += p.vz * dt;
@@ -609,7 +646,11 @@ function simulate(dt) {
     }
     const inp = canMove ? (p.cpu ? botInput(p, dt) : slotInput(p.i)) : { x: 0, y: 0, dash: false };
     // grip: normal ground stops you fast (easy to control), ice barely does
-    const grip = MAP.ice ? 1.6 : 5, dashGrip = MAP.ice ? 0.8 : 1.1;
+    const slipping = p.slip > 0;
+    const grip = MAP.ice || slipping ? 1.2 : 5, dashGrip = MAP.ice || slipping ? 0.7 : 1.1;
+    const here = tileAt(p.x, p.z);
+    if (canMove && here && here.belt && here.state !== 'gone') p.vx += here.belt * 11 * dt * (p.mega > 0 ? 0.6 : 1);
+    if (slipping) { p.slip -= dt; p.face += dt * 14; p.sq = Math.max(p.sq, 0.25); }
     const spd = p.zoom > 0 ? 1.45 : 1, acc = (MAP.ice ? 17 : 36) * spd / (p.mega > 0 ? 1.2 : 1);
     p.vx += inp.x * acc * dt; p.vz += inp.y * acc * dt;
     if (inp.dash && p.dashCd <= 0) {
@@ -669,6 +710,15 @@ function simulate(dt) {
     if (str > 12) shake = Math.max(shake, Math.min(0.5, str * 0.025));
     if (str > 12) hitStop = Math.max(hitStop, Math.min(0.09, 0.03 + str * 0.002)); // big bonks land with a beat of freeze
   }
+  // banana peels
+  for (const b of [...peels]) {
+    b.t += dt;
+    const t = tileAt(b.x, b.z);
+    let hit = null;
+    for (const q of players) if (q.alive && !q.falling && (q !== b.owner || b.t > 1.2) && Math.hypot(q.x - b.x, q.z - b.z) < 0.55 * q.scale + 0.25) { hit = q; break; }
+    if (hit) { hit.slip = 1.4; const a = Math.random() * 6.28; hit.vx += Math.cos(a) * 6; hit.vz += Math.sin(a) * 6; tone(380, 0.25, 'triangle', 0.25, 120); emit('slip', hit.i); feed(`<span style="color:${hit.slot.css}">${hit.slot.name}</span> slipped on a banana!`); }
+    if (hit || b.t > 12 || !t || t.state === 'gone') { scene.remove(b.mesh); peels.splice(peels.indexOf(b), 1); }
+  }
   // pickups
   for (const k of [...pickups]) {
     k.t += dt;
@@ -679,8 +729,25 @@ function simulate(dt) {
   }
 }
 
-const WARN_RED = new THREE.Color(0xff3b3b);
+const WARN_RED = new THREE.Color(0xff3b3b), BELT_GLOW = new THREE.Color(0xffd27a);
+function turnArena(dt) {
+  if (!MAP.spin) return;
+  const w = MAP.spin * dt; spinA += w;
+  const c = Math.cos(spinA), sn = Math.sin(spinA), cw = Math.cos(w), sw = Math.sin(w);
+  for (const t of tiles) {
+    t.x = t.ax * c - t.az * sn; t.z = t.ax * sn + t.az * c;
+    if (t.state !== 'gone') { t.mesh.position.x = t.x; t.mesh.position.z = t.z; t.mesh.rotation.y = -spinA; }
+  }
+  if (NET.client) return; // the host moves the blobs and pickups
+  const carry = (o) => { const x = o.x * cw - o.z * sw; o.z = o.x * sw + o.z * cw; o.x = x; };
+  for (const pl of players) if (pl.alive && !pl.falling && solid(pl.x, pl.z)) { carry(pl); pl.face -= w; }
+  for (const k of pickups) { carry(k); k.mesh.position.x = k.x; k.mesh.position.z = k.z; }
+  for (const b of peels) { carry(b); b.mesh.position.x = b.x; b.mesh.position.z = b.z; }
+}
 function updateTiles(dt) {
+  if (!NET.client) turnArena(dt);
+  // belts: a light that slides along each belt row
+  if (MAP.belt) for (const t of tiles) if (t.belt && t.state === 'ok') { const k = (Math.sin((t.x * t.belt) * 1.4 - performance.now() / 180) + 1) / 2; t.top.color.copy(t.base).lerp(BELT_GLOW, k * 0.35); }
   if (state === 'play' && !NET.client) {
     const okCount = updateCentroid();
     collapseT -= dt;
@@ -725,7 +792,7 @@ function render(dt, time) {
     else g.root.rotation.x = 0;
     g.root.rotation.z = p.teeter && !p.falling ? Math.sin(time * 28) * 0.18 : 0; // wobble on the edge
     g.squash.scale.set(1 + p.sq * 0.3, 1 - p.sq * 0.32, 1 + p.sq * 0.3);
-    g.mat.emissiveIntensity = p.zoom > 0 ? 0.35 + Math.sin(time * 18) * 0.25 : p.mega > 0 ? 0.25 : 0;
+    g.mat.emissiveIntensity = p.zoom > 0 ? 0.35 + Math.sin(time * 18) * 0.25 : p.magnet > 0 ? 0.3 + Math.sin(time * 9) * 0.2 : p.mega > 0 ? 0.25 : 0;
     g.crown.visible = top > 0 && p.score === top;
     g.ring.position.set(p.x, 0.03, p.z); g.ring.scale.setScalar(p.scale);
     g.ring.material.opacity = p.dashCd > 0 ? 0.25 : 0.9;
@@ -795,11 +862,21 @@ function frame(now) {
   pressed.clear();
   requestAnimationFrame(frame);
 }
+// ---------------- achievements + sync (sync.js) ----------------
+if (window.GameSync) GameSync.init({ game: 'bonkbowl', keys: [{ match: 'bonkbowl.stats', mode: 'max' }], idle: () => state === 'lobby', ach: [
+  { id: 'champ', name: 'Champion', desc: 'Win a match', test: (g) => ((g('bonkbowl.stats') || {}).wins || 0) > 0 },
+  { id: 'bonk10', name: 'Bonk-off', desc: 'Knock 10 blobs off in total', test: (g) => ((g('bonkbowl.stats') || {}).bonkoffs || 0) >= 10 },
+  { id: 'bonk100', name: 'Bowling ball', desc: 'Knock 100 blobs off in total', test: (g) => ((g('bonkbowl.stats') || {}).bonkoffs || 0) >= 100 },
+  { id: 'online', name: 'Long distance', desc: 'Play an online match', test: (g) => ((g('bonkbowl.stats') || {}).online || 0) > 0 },
+  { id: 'regular', name: 'Regular', desc: 'Play 25 matches', test: (g) => ((g('bonkbowl.stats') || {}).matches || 0) >= 25 }
+] });
+
 // ---------------- online play ----------------
 const r2 = (v) => Math.round(v * 100) / 100;
 const TILE_CH = { ok: 'o', warn: 'w', gone: 'g' };
 function sendSnap() {
-  NET.room.broadcast({ t: 's', st: state, mp: mapId, pl: players.map((p) => [p.i, r2(p.x), r2(p.y), r2(p.z), r2(p.vx), r2(p.vz), r2(p.face), (p.alive ? 1 : 0) | (p.falling ? 2 : 0) | (p.teeter ? 4 : 0) | (p.mega > 0 ? 8 : 0) | (p.zoom > 0 ? 16 : 0) | (p.dashCd > 0 ? 32 : 0), r2(p.scale), p.score, p.kos]),
+  NET.room.broadcast({ t: 's', st: state, mp: mapId, pl: players.map((p) => [p.i, r2(p.x), r2(p.y), r2(p.z), r2(p.vx), r2(p.vz), r2(p.face), (p.alive ? 1 : 0) | (p.falling ? 2 : 0) | (p.teeter ? 4 : 0) | (p.mega > 0 ? 8 : 0) | (p.zoom > 0 ? 16 : 0) | (p.dashCd > 0 ? 32 : 0) | (p.magnet > 0 ? 64 : 0) | (p.slip > 0 ? 128 : 0), r2(p.scale), p.score, p.kos]),
+    sa: r2(spinA), pe: peels.map((b) => [r2(b.x), r2(b.z)]),
     ti: tiles.map((t) => TILE_CH[t.state]).join(''), pk: pickups.map((k) => [k.type, r2(k.x), r2(k.z), r2(k.t)]), ev: NET.ev.splice(0) });
 }
 function onHostMsg(id, m) {
@@ -857,7 +934,7 @@ function applySnap(s, dt) {
     p.x += (a[1] + a[4] * 0.03 - p.x) * k; p.y += (a[2] - p.y) * k; p.z += (a[3] + a[5] * 0.03 - p.z) * k;
     p.vx = a[4]; p.vz = a[5];
     let d = a[6] - p.face; d = Math.atan2(Math.sin(d), Math.cos(d)); p.face += d * k;
-    p.alive = alive; p.falling = falling; p.teeter = !!(f & 4); p.mega = f & 8 ? 1 : 0; p.zoom = f & 16 ? 1 : 0; p.dashCd = f & 32 ? 1 : 0;
+    p.alive = alive; p.falling = falling; p.teeter = !!(f & 4); p.mega = f & 8 ? 1 : 0; p.zoom = f & 16 ? 1 : 0; p.dashCd = f & 32 ? 1 : 0; p.magnet = f & 64 ? 1 : 0; p.slip = f & 128 ? 1 : 0;
     p.scale = a[8];
     if (p.score !== a[9] || p.kos !== a[10]) { p.score = a[9]; p.kos = a[10]; renderHud(); }
     if (!alive) p.g.root.visible = false;
@@ -869,6 +946,10 @@ function applySnap(s, dt) {
     else if (c === 'w' && t.state === 'ok') { t.state = 'warn'; t.t = 1.3; }
     else if (c === 'g' && t.state !== 'gone') { t.state = 'warn'; t.t = 0; }
   }
+  // the Carousel's turn, and banana peels
+  if (MAP.spin && typeof s.sa === 'number') { spinA = s.sa - MAP.spin * dt; turnArena(dt); }
+  while (peels.length > (s.pe || []).length) scene.remove(peels.pop().mesh);
+  (s.pe || []).forEach((q, i) => { if (!peels[i]) dropPeel(q[0], q[1], null); peels[i].x = q[0]; peels[i].z = q[1]; peels[i].mesh.position.set(q[0], 0.62, q[1]); });
   // pickups
   while (pickMeshes.length > s.pk.length) scene.remove(pickMeshes.pop().mesh);
   s.pk.forEach((q, i) => {
@@ -888,9 +969,11 @@ function clientEvent(e) {
   else if (type === 'feed') { const d = document.createElement('div'); d.innerHTML = a[0]; $('feed').appendChild(d); setTimeout(() => d.remove(), 3500); }
   else if (type === 'big') { const b = $('big'); b.textContent = a[0]; b.style.color = a[1]; bigTimer = a[2]; b.classList.add('pop'); setTimeout(() => b.classList.remove('pop'), 120); }
   else if (type === 'beep') sfx.beep(!!a[0]);
+  else if (type === 'slip') tone(380, 0.25, 'triangle', 0.25, 120);
   else if (type === 'win') sfx.win();
   else if (type === 'round') { if (MAPS[a[0]] && a[0] !== mapId) buildArena(a[0]); resetTiles(); for (const p of players) { p.alive = true; p.falling = false; p.g.root.visible = true; p.g.ring.visible = true; p.g.root.rotation.x = 0; } renderHud(); }
-  else if (type === 'end') { show('end', true); $('endTitle').textContent = a[0]; $('endTitle').style.cssText = `font-size:clamp(36px,7vw,72px);color:${a[1]};background:none;-webkit-text-fill-color:${a[1]}`; $('endStats').innerHTML = a[2]; $('rematchBtn').classList.add('hidden'); $('lobbyBtn').textContent = 'Leave'; sfx.win(); }
+  else if (type === 'end') {
+    { const me = players.find((q) => q.i === NET.mySlot); stats.matches++; stats.online++; if (me) { stats.bonkoffs += me.kos; if (NET.mySlot >= 0 && a[0].startsWith(SLOTS[NET.mySlot].name + ' ')) stats.wins++; } saveStats(); } show('end', true); $('endTitle').textContent = a[0]; $('endTitle').style.cssText = `font-size:clamp(36px,7vw,72px);color:${a[1]};background:none;-webkit-text-fill-color:${a[1]}`; $('endStats').innerHTML = a[2]; $('rematchBtn').classList.add('hidden'); $('lobbyBtn').textContent = 'Leave'; sfx.win(); }
 }
 let hitStopC = 0;
 function clientFrame(dt, now) {
@@ -979,4 +1062,4 @@ if (settings.map !== 'random' && !MAPS[settings.map]) settings.map = 'meadow';
 buildArena(settings.map === 'random' ? 'meadow' : settings.map);
 renderLobby();
 requestAnimationFrame(frame);
-if (location.search.includes('test')) window.__bb = { info: () => ({ map: mapId, state, roundTime: +roundTime.toFixed(1), gone: tiles.filter((t) => t.state === 'gone').length, scores: players.map((p) => p.score), alive: players.map((p) => p.alive), pos: players.map((p) => [p.i, Math.round(p.x * 100) / 100, Math.round(p.z * 100) / 100]), net: NET.hosting ? 'host' : NET.client ? 'client' : '' }) };
+if (location.search.includes('test')) window.__bb = { info: () => ({ map: mapId, state, roundTime: +roundTime.toFixed(1), gone: tiles.filter((t) => t.state === 'gone').length, scores: players.map((p) => p.score), alive: players.map((p) => p.alive), pos: players.map((p) => [p.i, Math.round(p.x * 100) / 100, Math.round(p.z * 100) / 100]), spin: +spinA.toFixed(2), peels: peels.length, slip: players.map((p) => p.slip > 0), magnet: players.map((p) => p.magnet > 0), setMap: (m) => { settings.map = m; buildArena(m); }, give: (i, type) => { const p = players.find((q) => q.i === i); grab(p, { type, x: p.x, z: p.z }); }, net: NET.hosting ? 'host' : NET.client ? 'client' : '' }) };

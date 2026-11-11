@@ -1,5 +1,16 @@
 [
   {
+    "version": "1.4",
+    "date": "2026-11-11",
+    "title": "Carousel, Factory Floor, magnets and bananas",
+    "notes": [
+      "New arena: Carousel. The whole bowl turns and carries you with it.",
+      "New arena: Factory Floor. Conveyor belts push you sideways: ride them into a bonk, or fight them.",
+      "New power-ups: MAGNET pulls everyone toward you, BANANA drops a peel that sends whoever steps on it spinning.",
+      "Achievements: unlock them as you play (a 🏆 pops up), and see them all on the Game Library's new Profile page."
+    ]
+  },
+  {
     "version": "1.3",
     "date": "2026-11-11",
     "title": "Online",
