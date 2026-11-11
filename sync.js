@@ -169,6 +169,52 @@
   }
   function stop() { acc = null; ls.set(ACC, null); disconnect(); setStatus('off'); }
 
+  // ---------- accounts (the Game Library's sign-in) ----------
+  // A gamertag (Name#1234) and a password make the sync code (PBKDF2, slow on purpose), so signing in on
+  // any device lands on the same encrypted progress. No server ever sees the password. Forgotten = gone.
+  async function accountCode(tag, password) {
+    const base = await crypto.subtle.importKey('raw', te.encode(String(password)), 'PBKDF2', false, ['deriveBits']);
+    const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: te.encode('mmgames-account-v1:' + String(tag).toLowerCase()), iterations: 250000 }, base, 160));
+    return fmt([...bits].map((x) => ALPHA[x & 31]).join(''));
+  }
+  // a retained message on the relays, or null after a short wait
+  async function peek(topic, ms = 3500) {
+    const clients = await lbConnect();
+    return new Promise((res) => {
+      let done = false;
+      const fin = (v) => { if (done) return; done = true; for (const c of clients) { c.unsubscribe(topic); c.removeListener('message', on); } res(v); };
+      const on = (t, msg) => { if (t === topic && msg && msg.length) fin(new Uint8Array(msg)); };
+      for (const c of clients) { c.on('message', on); c.subscribe(topic, { qos: 1 }); }
+      setTimeout(() => fin(null), ms);
+    });
+  }
+  async function post(topic, body) {
+    const clients = await lbConnect();
+    const send = (c) => c.publish(topic, body, { qos: 1, retain: true });
+    for (const c of clients) { if (c.connected) send(c); else c.once('connect', () => send(c)); }
+  }
+  // has this code ever synced the given game? 'ok' (and it opens with this code) or 'none'
+  async function probe(code, game) {
+    const c = clean(code), id = hex(await sha('id:' + c)).slice(0, 32);
+    const key = await crypto.subtle.importKey('raw', await sha('key:' + c), 'AES-GCM', false, ['decrypt']);
+    const bytes = await peek(TOPIC + id + '/' + game);
+    if (!bytes) return 'none';
+    try { await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.slice(0, 12) }, key, bytes.slice(12)); return 'ok'; } catch { return 'none'; }
+  }
+  // gamertags: a public marker per tag (hashed) so a new account doesn't pick a tag someone has
+  const TAGS = 'mmgames/v1/tag/';
+  const tagTopic = async (tag) => TAGS + hex(await sha('tag:' + String(tag).toLowerCase())).slice(0, 32);
+  const tagTaken = async (tag) => !!(await peek(await tagTopic(tag), 3000));
+  const claimTag = async (tag) => post(await tagTopic(tag), JSON.stringify({ t: Date.now() }));
+  function signIn(code, tag, mode) {
+    if (acc) { disconnect(); }
+    start(code, mode === 'new' ? 'new' : 'join');
+    acc.tag = tag; jset(ACC, acc);
+    if (tag) ls.set('gamesync.name', tag.slice(0, 16));
+    if (mode === 'new') schedulePush(400);
+    setStatus(status);
+  }
+
   // ---------- UI ----------
   const CSS = `
 .gs-wrap{position:fixed;inset:0;z-index:2147483000;display:grid;place-items:center;background:rgba(0,0,0,.62);font:15px/1.45 system-ui,"Segoe UI",sans-serif;color:#eee;padding:16px}
@@ -185,6 +231,8 @@
 .gs-ach.show{transform:none}.gs-ach b{color:#ffd65a;font-size:15px}.gs-ach span{color:#cfc7a8}
 .gs-lb{margin:8px 0;padding-left:26px}.gs-lb li{display:flex;gap:10px;align-items:baseline;padding:4px 0;border-bottom:1px solid #2a2c33}.gs-lb li span{flex:1}.gs-lb li b{color:#ffd65a}.gs-lb li small{color:#9a9ca4;font-size:12px}.gs-lb li.me span{color:#8fb4ff;font-weight:700}
 .gs-name{font-size:15px!important;width:60%!important;display:inline-block;margin:0 0 0 6px!important;padding:5px 8px!important;text-transform:none!important}
+.gs-badge{font:800 10px system-ui,sans-serif;font-style:normal;letter-spacing:.08em;padding:1px 6px;border-radius:5px;vertical-align:2px;background:#3b6cf0;color:#fff}.gs-badge.owner{background:#c9a227;color:#1b1a14}
+.gs-ban{font:600 11px system-ui,sans-serif;color:#ff8a80;padding:1px 6px;margin-left:4px;border-radius:5px;border:1px solid #4a4d57;background:#262830;cursor:pointer}
 .gs-note button{font:600 13px system-ui,sans-serif;padding:6px 10px;border-radius:7px;border:0;background:#3b6cf0;color:#fff;cursor:pointer}`;
   let styled = false;
   const style = () => { if (styled) return; styled = true; const s = document.createElement('style'); s.textContent = CSS; document.head.appendChild(s); };
@@ -311,7 +359,8 @@
   // unsigned (it's for friends, not a contest). Names are shared by every game: 'gamesync.name'.
   const LB = 'mmgames/v1/lb/';
   const pid = () => { let p = ls.get('gamesync.pid'); if (!p) { p = hex(crypto.getRandomValues(new Uint8Array(8))); ls.set('gamesync.pid', p); } return p; };
-  const myName = () => (ls.get('gamesync.name') || '').slice(0, 16);
+  // signed in: always the account's gamertag (with the capitals it was made with, which the library stores in the name)
+  const myName = () => { const t = acc && acc.tag, n = ls.get('gamesync.name') || ''; return (t ? (n.toLowerCase() === t.toLowerCase() ? n : t) : n).slice(0, 16); };
   let lbP = null;
   function lbConnect() {
     if (lbP) return lbP;
@@ -324,7 +373,9 @@
     if (!(score > best) || !myName()) return false;
     ls.set('gamesync.lb.' + cfg.game + '.' + board, String(score));
     const clients = await lbConnect();
-    const body = JSON.stringify({ n: myName(), s: score, i: String(info || '').slice(0, 40), t: Date.now() });
+    const row = { n: myName(), s: score, i: String(info || '').slice(0, 40), t: Date.now() };
+    try { const m = await me(); if (m && lower(m.tag) === lower(row.n)) { const sg = await sign(m.k, { m: rowMsg(cfg.game, board, pid(), row) }); row.sig = sg.s; row.sp = sg.p; row.x = m.x; } } catch { /* post unsigned */ }
+    const body = JSON.stringify(row);
     const topic = LB + cfg.game + '/' + board + '/' + pid();
     const send = (c) => c.publish(topic, body, { qos: 1, retain: true });
     for (const c of clients) { if (c.connected) send(c); else c.once('connect', () => send(c)); }
@@ -333,15 +384,27 @@
   async function lbTop(board, n = 10) {
     const clients = await lbConnect();
     const topic = LB + cfg.game + '/' + board + '/+', rows = new Map();
+    const checks = Promise.all([staff().catch(() => []), bans().catch(() => new Map())]);
     const onMsg = (t, msg) => {
       if (!t.startsWith(LB + cfg.game + '/' + board + '/')) return;
       try { const r = JSON.parse(new TextDecoder().decode(msg)); const s = Number(r.s); if (!Number.isFinite(s) || s <= 0 || s > 1e9) return;
-        const who = t.slice(t.lastIndexOf('/') + 1), prev = rows.get(who); if (!prev || s > prev.s) rows.set(who, { n: String(r.n || '?').slice(0, 16), s, i: String(r.i || '').slice(0, 40), me: who === pid() }); } catch { /* junk */ }
+        const who = t.slice(t.lastIndexOf('/') + 1), prev = rows.get(who); if (!prev || s > prev.s) rows.set(who, { n: String(r.n || '?').slice(0, 16), s, i: String(r.i || '').slice(0, 40), me: who === pid(), pid: who, raw: r }); } catch { /* junk */ }
     };
     for (const c of clients) { c.on('message', onMsg); c.subscribe(topic); }
     await new Promise((r) => setTimeout(r, 2600));
     for (const c of clients) { c.unsubscribe(topic); c.removeListener('message', onMsg); }
-    return [...rows.values()].sort((a, b) => b.s - a.s).slice(0, n);
+    const [st, bn] = await checks, out = [];
+    for (const r of rows.values()) {
+      const who = st.find((p) => lower(p.tag) === lower(r.n));
+      if (!who && banned(bn, r.pid, r.n)) continue; // staff can't be banned off the boards
+      if (who) {
+        const ok = r.raw.x === who.x && r.raw.sp && (await verify({ p: r.raw.sp, s: r.raw.sig }, who.x, who.y))?.m === rowMsg(cfg.game, board, r.pid, r.raw);
+        if (!ok) continue; // someone using a staff member's name
+        r.badge = who.role;
+      }
+      delete r.raw; out.push(r);
+    }
+    return out.sort((a, b) => b.s - a.s).slice(0, n);
   }
   // The board panel: today's top 10, and a name box (your score is posted once you have a name).
   function board(boardId, title, mine) {
@@ -355,24 +418,143 @@
     w.addEventListener('click', (e) => { if (e.target === w) close(); });
     const draw = (rows, msg) => {
       box.innerHTML = `<h2>🏆 ${escH(title)}</h2>${msg ? `<p class="gs-small">${escH(msg)}</p>` : ''}
-        ${rows ? (rows.length ? `<ol class="gs-lb">${rows.map((r) => `<li class="${r.me ? 'me' : ''}"><span>${escH(r.n)}</span><b>${Math.floor(r.s).toLocaleString()}</b>${r.i ? `<small>${escH(r.i)}</small>` : ''}</li>`).join('')}</ol>` : '<p>No scores yet today. Be the first.</p>') : '<p>Loading today’s scores…</p>'}
-        <p class="gs-small">Your name on the boards (every game): <input class="gs-input gs-name" maxlength="16" value="${escH(myName())}" placeholder="Name"></p>
-        <div class="gs-row"><button class="gs-main" data-a="save">Save name</button><button data-a="close">Close</button></div>`;
-      const inp = box.querySelector('.gs-name');
+        ${rows ? (rows.length ? `<ol class="gs-lb">${rows.map((r) => `<li class="${r.me ? 'me' : ''}"><span>${escH(r.n)}${r.badge ? ` <em class="gs-badge ${r.badge}">${r.badge === 'owner' ? 'OWNER' : 'MOD'}</em>` : ''}${staffMe && !r.me && !r.badge ? ` <button class="gs-ban" data-ban="${escH(r.pid)}" data-n="${escH(r.n)}" title="Ban from every leaderboard">Ban</button>` : ''}</span><b>${Math.floor(r.s).toLocaleString()}</b>${r.i ? `<small>${escH(r.i)}</small>` : ''}</li>`).join('')}</ol>` : '<p>No scores yet today. Be the first.</p>') : '<p>Loading today’s scores…</p>'}
+        ${acc && acc.tag ? `<p class="gs-small">You're on the boards as <b>${escH(myName())}</b> (your Game Library account).</p><div class="gs-row"><button data-a="close">Close</button></div>`
+          : `<p class="gs-small">Your name on the boards (every game): <input class="gs-input gs-name" maxlength="16" value="${escH(myName())}" placeholder="Name"></p>
+        <div class="gs-row"><button class="gs-main" data-a="save">Save name</button><button data-a="close">Close</button></div>`}`;
+      box.querySelectorAll('[data-ban]').forEach((b) => { b.onclick = async () => { const why = prompt('Ban ' + b.dataset.n + ' from every leaderboard? Reason (shown to staff only):', ''); if (why === null) return; try { await setBan('pid:' + b.dataset.ban, true, why, b.dataset.n); await post(LB + cfg.game + '/' + boardId + '/' + b.dataset.ban, ''); load('Banned ' + b.dataset.n + '.'); } catch { load('Couldn’t ban (are you still staff?).'); } }; });
+      box.querySelector('[data-a=close]').onclick = close;
+      const inp = box.querySelector('.gs-name'); if (!inp) return;
       inp.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') box.querySelector('[data-a=save]').click(); });
       inp.addEventListener('keyup', (e) => e.stopPropagation());
-      box.querySelector('[data-a=close]').onclick = close;
       box.querySelector('[data-a=save]').onclick = async () => {
-        const v = inp.value.trim().replace(/[^\w .\-'!?]/g, '').slice(0, 16); if (!v) return;
+        const v = inp.value.trim().replace(/[^\w .\-'!?#]/g, '').slice(0, 16); if (!v) return;
+        if ((await staff().catch(() => [])).some((p) => lower(p.tag) === lower(v))) { load('That name belongs to a staff member. Pick another.'); return; }
         ls.set('gamesync.name', v);
         if (mine && mine.score > 0) await lbPost(boardId, mine.score, mine.info).catch(() => {});
         load('Saved. Updating…');
       };
     };
-    const load = async (msg) => { draw(null, msg); try { const rows = await lbTop(boardId); draw(rows, myName() ? '' : 'Pick a name to put your score on the board.'); } catch { draw([], 'Couldn’t reach the scoreboard. Check your connection.'); } };
+    let staffMe = null;
+    const load = async (msg) => { draw(null, msg); staffMe = await me().catch(() => null); try { const rows = await lbTop(boardId); draw(rows, myName() ? '' : 'Pick a name to put your score on the board.'); } catch { draw([], 'Couldn’t reach the scoreboard. Check your connection.'); } };
     document.body.appendChild(w);
     (async () => { if (mine && mine.score > 0 && myName()) await lbPost(boardId, mine.score, mine.info).catch(() => {}); load(); })();
   }
+
+  // ---------- staff: the owner and moderators ----------
+  // There's no server, so authority comes from signatures. The owner's public key is below; the owner signs
+  // the list of moderators (each with their own key), and every ban, announcement and gift is signed by
+  // whoever made it. Everyone's browser checks the signatures, so a faked message is simply ignored.
+  // A staff key is pasted once (owner key / moderator invite) and syncs through that person's account.
+  const OWNER = { tag: 'GIGACHAD#8122', x: 'v4TcFLCKDh2Y8V8xIn4lZkXB5Kbbv9pHmTPOTo_6fG8', y: 'aDJQcqtUc0OJBy-sfwOv6WMfK9TDb-wU2CszcRbbN-s' };
+  const MOD = 'mmgames/v1/mod/', STAFFKEY = 'gamelib.staffkey';
+  const ub = (str) => { const b = atob(str.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((str.length + 3) % 4)); return Uint8Array.from(b, (c) => c.charCodeAt(0)); };
+  const bu = (u) => btoa(String.fromCharCode(...u)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const EC = { name: 'ECDSA', namedCurve: 'P-256' }, SIG = { name: 'ECDSA', hash: 'SHA-256' };
+  const vkeys = new Map();
+  const verifyKey = (x, y) => { const k = x + y; if (!vkeys.has(k)) vkeys.set(k, crypto.subtle.importKey('jwk', { kty: 'EC', crv: 'P-256', x, y, ext: true }, EC, false, ['verify'])); return vkeys.get(k); };
+  async function verify(env, x, y) {
+    try { if (!env || typeof env.p !== 'string' || typeof env.s !== 'string') return null;
+      return (await crypto.subtle.verify(SIG, await verifyKey(x, y), ub(env.s), te.encode(env.p))) ? JSON.parse(env.p) : null; } catch { return null; }
+  }
+  // a pasted key: OWNER-... or MOD-... = base64url(d | x | y)
+  async function parseKey(code) {
+    const m = String(code || '').trim().match(/^(OWNER|MOD)-([A-Za-z0-9_-]{120,140})$/); if (!m) return null;
+    const u = ub(m[2]); if (u.length !== 96) return null;
+    const x = bu(u.slice(32, 64)), y = bu(u.slice(64));
+    try { const key = await crypto.subtle.importKey('jwk', { kty: 'EC', crv: 'P-256', d: bu(u.slice(0, 32)), x, y, ext: true }, EC, false, ['sign']); return { kind: m[1], key, x, y }; } catch { return null; }
+  }
+  const sign = async (k, obj) => { const p = JSON.stringify(obj); return { p, s: bu(new Uint8Array(await crypto.subtle.sign(SIG, k.key, te.encode(p)))), x: k.x }; };
+  const lower = (t) => String(t || '').toLowerCase();
+  const short = async (t) => hex(await sha(t)).slice(0, 24);
+  // every retained message under a topic filter, collected for a moment
+  async function collect(filter, ms = 2600) {
+    const clients = await lbConnect(), got = new Map(), base = filter.replace(/[+#].*$/, '');
+    const on = (t, msg) => { if (t.startsWith(base) && msg && msg.length) got.set(t, td.decode(msg)); };
+    for (const c of clients) { c.on('message', on); c.subscribe(filter, { qos: 1 }); }
+    await new Promise((r) => setTimeout(r, ms));
+    for (const c of clients) { c.unsubscribe(filter); c.removeListener('message', on); }
+    return got;
+  }
+  const jparse = (t) => { try { return JSON.parse(t); } catch { return null; } };
+  const fresh = (box, ms, fn) => { if (!box.p || Date.now() - box.t > ms) { box.t = Date.now(); box.p = fn(); box.p.catch(() => { box.p = null; }); } return box.p; };
+  // who is staff: [{ tag, x, y, role }]
+  const staffBox = {};
+  function staff(force) {
+    if (force) staffBox.p = null;
+    return fresh(staffBox, 60000, async () => {
+      const list = [{ tag: OWNER.tag, x: OWNER.x, y: OWNER.y, role: 'owner' }];
+      const raw = (await collect(MOD + 'roles', 2200)).get(MOD + 'roles');
+      const doc = raw && await verify(jparse(raw), OWNER.x, OWNER.y);
+      for (const m of (doc && doc.mods) || []) if (m && m.tag && m.x && m.y) list.push({ tag: String(m.tag), x: m.x, y: m.y, role: 'mod' });
+      return list;
+    });
+  }
+  // this device's staff key, if it has one that is (still) on the staff list
+  async function me() {
+    const k = await parseKey(ls.get(STAFFKEY)); if (!k) return null;
+    const who = (await staff()).find((p) => p.x === k.x && p.y === k.y);
+    return who ? { ...who, k } : null;
+  }
+  async function setStaffKey(code) {
+    const k = await parseKey(code); if (!k) return 'That isn’t a staff key.';
+    const who = (await staff(true)).find((p) => p.x === k.x && p.y === k.y);
+    if (!who) return k.kind === 'OWNER' ? 'That owner key doesn’t match.' : 'That invite isn’t on the moderator list (it may have been removed).';
+    if (acc && acc.tag && lower(acc.tag) !== lower(who.tag)) return 'That key belongs to ' + who.tag + '. Sign in as them first.';
+    ls.set(STAFFKEY, String(code).trim()); schedulePush(500); return null;
+  }
+  // bans: each staff member keeps their own signed list; the newest word on a player wins
+  const banBox = {};
+  function bans(force) {
+    if (force) banBox.p = null;
+    return fresh(banBox, 45000, async () => {
+      const [list, got] = await Promise.all([staff(), collect(MOD + 'bans/+', 2600)]);
+      const out = new Map(), mine = {};
+      for (const [topic, raw] of got) {
+        const env = jparse(raw); if (!env) continue;
+        const who = list.find((p) => p.x === env.x); if (!who) continue;
+        const doc = await verify(env, who.x, who.y); if (!doc || !Array.isArray(doc.list)) continue;
+        mine[topic] = doc.list;
+        for (const b of doc.list) { if (!b || !b.target) continue; const prev = out.get(b.target); if (!prev || (b.t || 0) > (prev.t || 0)) out.set(b.target, { ...b, by: who.tag }); }
+      }
+      out.lists = mine; return out;
+    });
+  }
+  async function setBan(target, ban, reason, name) {
+    const m = await me(); if (!m) throw new Error('not staff');
+    const all = await bans(true), topic = MOD + 'bans/' + await short('k:' + m.x);
+    const list = (all.lists[topic] || []).filter((b) => b.target !== target);
+    list.push({ target, ban: !!ban, reason: String(reason || '').slice(0, 120), name: String(name || '').slice(0, 24), t: Date.now() });
+    await post(topic, JSON.stringify(await sign(m.k, { list: list.slice(-400), t: Date.now() })));
+    banBox.p = null;
+  }
+  const banned = (b, pidv, name) => { const a = b.get('pid:' + pidv), n = b.get('name:' + lower(name)); return !!((a && a.ban) || (n && n.ban)); };
+  // owner: the moderator list
+  async function setMods(mods) {
+    const m = await me(); if (!m || m.role !== 'owner') throw new Error('owner only');
+    await post(MOD + 'roles', JSON.stringify(await sign(m.k, { mods, t: Date.now() })));
+    staffBox.p = null;
+  }
+  async function addMod(tag) {
+    const kp = await crypto.subtle.generateKey(EC, true, ['sign', 'verify']), j = await crypto.subtle.exportKey('jwk', kp.privateKey);
+    const mods = (await staff(true)).filter((p) => p.role === 'mod' && lower(p.tag) !== lower(tag)).map(({ tag: t, x, y }) => ({ tag: t, x, y }));
+    mods.push({ tag, x: j.x, y: j.y, t: Date.now() }); await setMods(mods);
+    const u = new Uint8Array(96); u.set(ub(j.d), 0); u.set(ub(j.x), 32); u.set(ub(j.y), 64);
+    return 'MOD-' + bu(u);
+  }
+  async function removeMod(tag) { await setMods((await staff(true)).filter((p) => p.role === 'mod' && lower(p.tag) !== lower(tag)).map(({ tag: t, x, y }) => ({ tag: t, x, y }))); }
+  // owner: the announcement on the library, and gifts (coins and shop items) to a gamertag
+  async function news() { const raw = (await collect(MOD + 'news', 2200)).get(MOD + 'news'); const d = raw && await verify(jparse(raw), OWNER.x, OWNER.y); return d && d.text ? d : null; }
+  async function postNews(text) { const m = await me(); if (!m || m.role !== 'owner') throw new Error('owner only'); await post(MOD + 'news', text ? JSON.stringify(await sign(m.k, { text: String(text).slice(0, 400), t: Date.now() })) : ''); }
+  const giftTopic = async (tag) => MOD + 'gift/' + await short('gift:' + lower(tag));
+  async function gifts(tag) { const t = await giftTopic(tag), raw = (await collect(t, 2200)).get(t); const d = raw && await verify(jparse(raw), OWNER.x, OWNER.y); return d && lower(d.tag) === lower(tag) && Array.isArray(d.gifts) ? d.gifts : []; }
+  async function giveGift(tag, g) {
+    const m = await me(); if (!m || m.role !== 'owner') throw new Error('owner only');
+    const list = await gifts(tag); list.push({ id: hex(crypto.getRandomValues(new Uint8Array(6))), coins: Math.round(Number(g.coins) || 0), item: g.item || null, note: String(g.note || '').slice(0, 80), t: Date.now() });
+    await post(await giftTopic(tag), JSON.stringify(await sign(m.k, { tag, gifts: list.slice(-200), t: Date.now() })));
+  }
+  // a leaderboard row from staff carries a signature, so nobody else can post under a staff name
+  const rowMsg = (game, board, pidv, r) => [game, board, pidv, r.n, r.s, r.t].join('|');
 
   // ---------- QR codes (from Trigger Happy's qr.js: byte mode, level M, versions 1-10) ----------
   // QR codes for share links, drawn as SVG. Byte mode, error correction level M, versions 1-10
@@ -597,5 +779,8 @@
 
 
   window.GameSync = { init, open: panel, get on() { return !!acc; }, get status() { return status; },
-    unlock: (id) => unlock(id), board, postScore: (b, s, i) => lbPost(b, s, i).catch(() => false) };
+    unlock: (id) => unlock(id), board, postScore: (b, s, i) => lbPost(b, s, i).catch(() => false),
+    get account() { return acc ? { tag: acc.tag || null, since: acc.since } : null; }, accountCode, probe, tagTaken, claimTag, signIn, signOut: stop,
+    syncNow: () => publish().catch(() => {}), onStatus: (f) => onChange.push(f),
+    staff: { OWNER, list: staff, me, setKey: setStaffKey, clearKey: () => ls.set(STAFFKEY, ''), bans, setBan, addMod, removeMod, news, postNews, gifts, giveGift } };
 })();
