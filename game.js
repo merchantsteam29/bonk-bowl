@@ -7,7 +7,8 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem('bonkbowl.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { try { localStorage.setItem('bonkbowl.' + k, JSON.stringify(v)); } catch {} },
 };
-const settings = { controllers: store.get('controllers', true), target: store.get('target', 5), map: store.get('map', 'meadow'), cpu: store.get('cpu', 'easy') };
+const settings = { controllers: store.get('controllers', true), target: store.get('target', 5), map: store.get('map', 'meadow'), cpu: store.get('cpu', 'easy'),
+  vol: store.get('vol', 0.8), shake: store.get('shake', 1), autoRes: store.get('autoRes', true) };
 // CPU difficulty: how often they rethink, how keen they are to dash, dash range, how hard they push the stick
 const CPU = {
   easy:   { label: 'Easy',   think: 0.4,  aggr: 0.8, range: 2.4, push: 0.7 },
@@ -36,7 +37,7 @@ addEventListener('keydown', (e) => {
   held.add(e.code);
 });
 addEventListener('keyup', (e) => held.delete(e.code));
-addEventListener('blur', () => held.clear());
+addEventListener('blur', () => { held.clear(); if (typeof setPaused === 'function' && (state === 'play' || state === 'countdown')) setPaused(true); });
 addEventListener('pointerdown', () => audio());
 const anyHeld = (codes) => codes.some((c) => held.has(c));
 const anyPressed = (codes) => codes.some((c) => pressed.has(c));
@@ -86,7 +87,7 @@ function slotInput(i) {
 let ac = null, master = null;
 function audio() {
   if (!ac) {
-    try { ac = new (window.AudioContext || window.webkitAudioContext)(); master = ac.createGain(); master.gain.value = 0.6; master.connect(ac.destination); }
+    try { ac = new (window.AudioContext || window.webkitAudioContext)(); master = ac.createGain(); master.gain.value = 0.6 * settings.vol; master.connect(ac.destination); }
     catch { return null; }
   }
   if (ac.state === 'suspended') ac.resume();
@@ -433,6 +434,29 @@ $('cpuLevel').addEventListener('click', (e) => {
   settings.cpu = b.dataset.cpu; store.set('cpu', settings.cpu); renderLobby();
 });
 $('startBtn').addEventListener('click', () => tryStart());
+// ---- settings panel (lobby and pause) ----
+let setOpen = false, setFrom = 'lobby';
+function syncSettings() {
+  $('sVol').value = settings.vol; $('oVol').textContent = Math.round(settings.vol * 100) + '%';
+  $('shakeSeg').querySelectorAll('button').forEach((b) => b.classList.toggle('sel', +b.dataset.v === settings.shake));
+  $('autoResBtn').textContent = settings.autoRes ? 'ON' : 'OFF'; $('autoResBtn').classList.toggle('sel', settings.autoRes);
+  $('fsBtn').textContent = document.fullscreenElement ? 'Leave fullscreen' : 'Fullscreen';
+  if (master) master.gain.value = 0.6 * settings.vol;
+  store.set('vol', settings.vol); store.set('shake', settings.shake); store.set('autoRes', settings.autoRes);
+}
+function openSettings() { setFrom = paused ? 'pause' : 'lobby'; show(setFrom, false); show('setPanel', true); setOpen = true; syncSettings(); }
+function closeSettings() { show('setPanel', false); show(setFrom, true); setOpen = false; }
+$('setBtn').addEventListener('click', openSettings);
+$('pSetBtn').addEventListener('click', openSettings);
+$('setDone').addEventListener('click', closeSettings);
+$('sVol').addEventListener('input', () => { settings.vol = +$('sVol').value; syncSettings(); });
+$('sVol').addEventListener('change', () => { if (audio()) sfx.beep(false); });
+$('shakeSeg').addEventListener('click', (e) => { const b = e.target.closest('button[data-v]'); if (b) { settings.shake = +b.dataset.v; syncSettings(); } });
+$('autoResBtn').addEventListener('click', () => { settings.autoRes = !settings.autoRes; if (!settings.autoRes) gov.reset(); syncSettings(); });
+$('fsBtn').addEventListener('click', () => { const r = document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.(); r?.catch?.(() => {}); });
+document.addEventListener('fullscreenchange', () => { if (setOpen) syncSettings(); });
+if (!document.documentElement.requestFullscreen) $('fsBtn').classList.add('hidden');
+document.addEventListener('visibilitychange', () => { if (!ac) return; if (document.hidden) ac.suspend().catch(() => {}); else ac.resume().catch(() => {}); });
 $('resumeBtn').addEventListener('click', () => setPaused(false));
 $('quitBtn').addEventListener('click', () => toLobby());
 $('rematchBtn').addEventListener('click', () => startMatch());
@@ -453,6 +477,7 @@ function lobbyInput() {
 function tryStart() { if (slotState.filter((s) => s !== 'empty').length >= 2) startMatch(); }
 
 // ---------------- game flow ----------------
+let hitStop = 0, slowT = 0; // game feel: freeze on big bonks, slow motion when the round is decided
 let state = 'lobby', stateT = 0, roundTime = 0, endPending = -1, collapseT = 0, clock = 0, paused = false;
 function show(id, on) { $(id).classList.toggle('hidden', !on); }
 function toLobby() {
@@ -467,6 +492,7 @@ function startMatch() {
   startRound();
 }
 function startRound() {
+  hitStop = 0; slowT = 0;
   if (settings.map === 'random') {
     const pick = MAP_IDS.filter((id) => id !== mapId);
     buildArena(pick[(Math.random() * pick.length) | 0]);
@@ -609,6 +635,7 @@ function simulate(dt) {
     const cx = A.x + nx * 0.55 * A.scale, cz = A.z + nz * 0.55 * A.scale;
     burst(cx, 0.6, cz, A.slot.color, 5 + (str | 0) / 2, 3 + str * 0.25); burst(cx, 0.6, cz, B.slot.color, 5 + (str | 0) / 2, 3 + str * 0.25);
     if (str > 12) shake = Math.max(shake, Math.min(0.5, str * 0.025));
+    if (str > 12) hitStop = Math.max(hitStop, Math.min(0.09, 0.03 + str * 0.002)); // big bonks land with a beat of freeze
   }
   // pickups
   for (const k of [...pickups]) {
@@ -685,7 +712,8 @@ function render(dt, time) {
   shake *= Math.exp(-6 * dt);
   if (state === 'lobby') camDrift.set(Math.sin(time * 0.15) * 6, 0, Math.cos(time * 0.15) * 4 - 2); else camDrift.set(0, 0, 0);
   camera.position.copy(camBase).add(camDrift);
-  camera.position.x += (Math.random() - 0.5) * shake; camera.position.y += (Math.random() - 0.5) * shake;
+  const sk = shake * settings.shake;
+  camera.position.x += (Math.random() - 0.5) * sk; camera.position.y += (Math.random() - 0.5) * sk;
   camera.lookAt(0, 0, 0.8);
   renderer.render(scene, camera);
 }
@@ -694,10 +722,11 @@ function render(dt, time) {
 let last = performance.now();
 function frame(now) {
   const raw = (now - last) / 1000, dt = Math.min(0.05, raw); last = now;
-  if (state !== 'lobby' && !paused) gov.tick(raw);
+  if (state !== 'lobby' && !paused && settings.autoRes) gov.tick(raw);
   pollPads();
   const escape = pressed.has('Escape') || anyPadPressed(9);
-  if (state === 'lobby') lobbyInput();
+  if (setOpen) { if (escape || anyPadPressed(1)) closeSettings(); }
+  else if (state === 'lobby') lobbyInput();
   else if (state === 'end') {
     if (pressed.has('Space') || anyPadPressed(0, 9)) startMatch();
     else if (pressed.has('Escape') || anyPadPressed(1)) toLobby();
@@ -717,17 +746,18 @@ function frame(now) {
       roundTime += dt;
       pickTimer -= dt;
       if (pickTimer <= 0) { pickTimer = 5 + Math.random() * 3; if (pickups.length < 2) spawnPickup(); }
-      if (endPending < 0 && players.filter((p) => p.alive && !p.falling).length <= 1) endPending = 1.0;
+      if (endPending < 0 && players.filter((p) => p.alive && !p.falling).length <= 1) { endPending = 1.0; slowT = 0.7; }
       if (endPending >= 0) { endPending -= dt; if (endPending < 0) finishRound(); }
     } else if (state === 'roundEnd') {
       stateT -= dt;
       if (stateT <= 0) { if (players.some((p) => p.score >= settings.target)) showMatchEnd(); else startRound(); }
     }
-    simulate(dt);
-    updateTiles(dt);
+    let sdt = dt;
+    if (hitStop > 0) { hitStop -= dt; sdt = 0; } else if (slowT > 0) { slowT -= dt; sdt = dt * 0.35; }
+    if (sdt > 0) { simulate(sdt); updateTiles(sdt); }
   }
   if (bigTimer > 0) { bigTimer -= dt; if (bigTimer <= 0) $('big').textContent = ''; }
-  render(paused ? 0 : dt, now / 1000);
+  render(paused || hitStop > 0 ? 0 : slowT > 0 ? dt * 0.35 : dt, now / 1000);
   pressed.clear();
   requestAnimationFrame(frame);
 }

@@ -53,6 +53,11 @@
   #feed div { background:var(--panel); padding:6px 12px; border-radius:10px; font-weight:700; animation:fade 3.5s forwards; }
   @keyframes fade { 0%,80% { opacity:1 } 100% { opacity:0 } }
   #help { position:fixed; bottom:12px; right:16px; font-size:12px; opacity:.5; pointer-events:none; }
+  .setbox { display:flex; flex-direction:column; gap:14px; background:var(--panel); border-radius:18px; padding:18px 22px; width:min(420px, 100%); }
+  .setbox label { display:grid; grid-template-columns:1fr auto; gap:6px; font-weight:800; text-align:left; }
+  .setbox output { color:var(--gold); }
+  .setbox input[type=range] { grid-column:1 / -1; width:100%; accent-color:var(--gold); }
+  #setDone { font-size:18px; padding:10px 28px; background:linear-gradient(90deg,#ff4d5e,#ff8a3d); }
   .stats { display:flex; gap:14px; flex-wrap:wrap; justify-content:center; }
   .stats div { background:var(--panel); border-radius:14px; padding:10px 18px; border:2px solid var(--c); }
   .stats b { color:var(--c); display:block; font-size:20px; }
@@ -80,6 +85,7 @@
     <button data-target="3">3</button><button data-target="5">5</button><button data-target="7">7</button>
     <span style="width:12px"></span>
     <button id="ctrlToggle">Controllers: ON</button>
+    <button id="setBtn">⚙ Settings</button>
   </div>
   <button id="startBtn">START &nbsp;(Space)</button>
     <button id="installApp" style="display:none">Install as an app</button>
@@ -94,7 +100,19 @@
 
 <div id="pause" class="overlay hidden">
   <h1 style="font-size:64px">PAUSED</h1>
-  <div class="row"><button id="resumeBtn">Resume (Esc)</button><button id="quitBtn">Quit to lobby (Backspace)</button></div>
+  <div class="row"><button id="resumeBtn">Resume (Esc)</button><button id="pSetBtn">⚙ Settings</button><button id="quitBtn">Quit to lobby (Backspace)</button></div>
+</div>
+
+<div id="setPanel" class="overlay hidden">
+  <h1 style="font-size:clamp(36px,6vw,64px)">SETTINGS</h1>
+  <div class="setbox">
+    <label>Volume <output id="oVol"></output><input type="range" id="sVol" min="0" max="1" step="0.05"></label>
+    <div class="row"><span>Screen shake:</span><span id="shakeSeg" class="row"><button data-v="1">Full</button><button data-v="0.4">Reduced</button><button data-v="0">Off</button></span></div>
+    <div class="row"><span>Auto resolution:</span><button id="autoResBtn">ON</button></div>
+    <p class="small" style="margin:-4px auto 0">Lowers the resolution a little when the frame rate drops, so the game stays smooth.</p>
+    <div class="row"><button id="fsBtn">Fullscreen</button></div>
+  </div>
+  <button id="setDone">Done (Esc)</button>
 </div>
 
 <div id="end" class="overlay hidden">
