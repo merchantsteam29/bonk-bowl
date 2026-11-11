@@ -1,6 +1,7 @@
 // BONK BOWL: 3-player local sumo on one device.
 import * as THREE from 'three';
 import { createGovernor } from './perf.js';
+import { Room } from './net.js';
 
 const $ = (id) => document.getElementById(id);
 const store = {
@@ -25,7 +26,11 @@ const SLOTS = [
   { name: 'GOLD', color: 0xffc62e, css: '#ffc62e', hint: 'Move Arrow keys<br>Dash Enter / Numpad 0',
     keys: { up: ['ArrowUp'], down: ['ArrowDown'], left: ['ArrowLeft'], right: ['ArrowRight'], dash: ['Enter', 'NumpadEnter', 'Numpad0', 'Slash'] } },
 ];
-const slotState = ['empty', 'empty', 'empty']; // empty | human | cpu
+const slotState = ['empty', 'empty', 'empty']; // empty | human | cpu | net (a friend online)
+// ---------------- online (net.js) ----------------
+// NET.hosting: this browser runs the match for friends. NET.client: this browser mirrors a friend's match.
+const NET = { room: null, hosting: false, client: false, ev: [], snapT: 0, peerSlot: new Map(), names: ['', '', ''], input: [null, null, null], mySlot: -1, snap: null, sendT: 0, dashQ: false };
+const emit = (...e) => { if (NET.hosting) NET.ev.push(e); };
 
 // ---------------- input ----------------
 const held = new Set(), pressed = new Set();
@@ -69,6 +74,7 @@ const padForSlot = (i) => { for (const st of pads.values()) if (st.slot === i) r
 const anyPadPressed = (...btns) => { for (const st of pads.values()) for (const b of btns) if (padPressed(st, b)) return true; return false; };
 
 function slotInput(i) {
+  if (slotState[i] === 'net') { const n = NET.input[i] || { x: 0, y: 0, dash: false }; const d = n.dash; n.dash = false; return { x: n.x, y: n.y, dash: d }; }
   const k = SLOTS[i].keys;
   let x = 0, y = 0;
   if (anyHeld(k.left)) x -= 1; if (anyHeld(k.right)) x += 1;
@@ -79,6 +85,15 @@ function slotInput(i) {
     x += pad.move.x; y += pad.move.y;
     if (padPressed(pad, 0) || padPressed(pad, 2) || padPressed(pad, 5) || padPressed(pad, 7)) dash = true;
   }
+  const m = Math.hypot(x, y); if (m > 1) { x /= m; y /= m; }
+  return { x, y, dash };
+}
+
+function clientInput() {
+  let x = 0, y = 0;
+  for (const s of SLOTS) { const k = s.keys; if (anyHeld(k.left)) x -= 1; if (anyHeld(k.right)) x += 1; if (anyHeld(k.up)) y -= 1; if (anyHeld(k.down)) y += 1; }
+  let dash = SLOTS.some((s) => anyPressed(s.keys.dash)) || pressed.has('Space');
+  for (const st of pads.values()) { x += st.move.x; y += st.move.y; if (padPressed(st, 0) || padPressed(st, 2) || padPressed(st, 5) || padPressed(st, 7)) dash = true; }
   const m = Math.hypot(x, y); if (m > 1) { x /= m; y /= m; }
   return { x, y, dash };
 }
@@ -325,7 +340,7 @@ function createPlayers() {
   players = [];
   SLOTS.forEach((s, i) => {
     if (slotState[i] === 'empty') return;
-    players.push({ i, slot: s, cpu: slotState[i] === 'cpu', g: makeBlob(s.color), score: 0, kos: 0,
+    players.push({ i, slot: s, cpu: slotState[i] === 'cpu', net: slotState[i] === 'net', g: makeBlob(s.color), score: 0, kos: 0,
       ai: { think: 0, goal: { x: 0, z: 0 }, safe: { x: 0, z: 0 }, target: null, dist: 99, aggr: 0.8 + Math.random() * 0.4 } });
   });
 }
@@ -360,7 +375,7 @@ function spawnPickup() {
   pickups.push({ type, x: t.x, z: t.z, mesh, t: 0 });
 }
 function grab(p, k) {
-  sfx.pickup(); burst(k.x, 0.7, k.z, PICK[k.type].color, 14, 5);
+  sfx.pickup(); burst(k.x, 0.7, k.z, PICK[k.type].color, 14, 5); emit('grab', k.type, +k.x.toFixed(2), +k.z.toFixed(2), p.i);
   feed(`<span style="color:${p.slot.css}">${p.slot.name}</span> got ${PICK[k.type].label}!`);
   if (k.type === 'mega') p.mega = 6;
   if (k.type === 'zoom') { p.zoom = 6; p.dashCd = 0; }
@@ -376,19 +391,23 @@ function grab(p, k) {
 
 // ---------------- HUD ----------------
 function feed(html) {
+  emit('feed', html);
   const d = document.createElement('div'); d.innerHTML = html; $('feed').appendChild(d);
   setTimeout(() => d.remove(), 3500);
 }
 let bigTimer = 0;
 function big(text, color = '#fff', time = 1.2) {
+  emit('big', text, color, time);
   const b = $('big'); b.textContent = text; b.style.color = color; bigTimer = time;
   b.classList.add('pop'); setTimeout(() => b.classList.remove('pop'), 120);
 }
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+const who = (p) => p.cpu ? p.slot.name + ' (CPU)' : (p.net || NET.client) && NET.names[p.i] ? esc(NET.names[p.i]) : p.slot.name;
 function renderHud() {
   const top = Math.max(...players.map((p) => p.score));
   $('hud').innerHTML = players.map((p) => {
     let pips = ''; for (let i = 0; i < settings.target; i++) pips += `<span class="pip ${i < p.score ? 'f' : ''}"></span>`;
-    return `<div class="pill ${p.alive ? '' : 'out'}" style="--c:${p.slot.css}"><span class="n">${top > 0 && p.score === top ? '👑 ' : ''}${p.slot.name}${p.cpu ? ' (CPU)' : ''}</span>${pips}</div>`;
+    return `<div class="pill ${p.alive ? '' : 'out'}" style="--c:${p.slot.css}"><span class="n">${top > 0 && p.score === top ? '👑 ' : ''}${who(p)}</span>${pips}</div>`;
   }).join('');
 }
 
@@ -396,24 +415,29 @@ function renderHud() {
 function renderLobby() {
   $('cards').innerHTML = SLOTS.map((s, i) => {
     const st = slotState[i], pad = padForSlot(i);
-    const status = st === 'human' ? (pad ? '🎮 READY!' : 'READY!') : st === 'cpu' ? '🤖 CPU' : 'Press dash to join';
+    const status = st === 'net' ? '🌐 ' + esc(NET.names[i] || 'Friend') + (NET.client && NET.mySlot === i ? ' (you)' : '') : st === 'human' ? (pad ? '🎮 READY!' : 'READY!') : st === 'cpu' ? '🤖 CPU' : NET.client ? 'Empty' : 'Press dash to join';
     return `<div class="card ${st !== 'empty' ? 'on' : ''}" style="--c:${s.css}" data-slot="${i}">
       <div class="blob"></div><div class="nm">${s.name}</div>
       <div class="keys">${s.hint}<br><span style="opacity:.7">or controller: press A</span></div>
       <div class="st">${status}</div>
-      <button data-slot="${i}">${st === 'empty' ? 'Add CPU' : 'Remove'}</button></div>`;
+      ${NET.client ? '' : `<button data-slot="${i}">${st === 'empty' ? 'Add CPU' : st === 'net' ? 'Kick' : 'Remove'}</button>`}</div>`;
   }).join('');
   document.querySelectorAll('[data-target]').forEach((b) => b.classList.toggle('sel', +b.dataset.target === settings.target));
   $('ctrlToggle').textContent = 'Controllers: ' + (settings.controllers ? 'ON' : 'OFF');
   $('maps').innerHTML = [...MAP_IDS, 'random'].map((id) => `<button data-map="${id}" class="${settings.map === id ? 'sel' : ''}">${id === 'random' ? '🎲 Random' : MAPS[id].name}</button>`).join('');
   $('mapDesc').textContent = settings.map === 'random' ? 'A different map every round.' : MAPS[settings.map].desc;
   $('cpuLevel').innerHTML = Object.keys(CPU).map((id) => `<button data-cpu="${id}" class="${settings.cpu === id ? 'sel' : ''}">${CPU[id].label}</button>`).join('');
-  $('startBtn').disabled = slotState.filter((s) => s !== 'empty').length < 2;
+  $('startBtn').disabled = NET.client || slotState.filter((s) => s !== 'empty').length < 2;
+  $('startBtn').innerHTML = NET.client ? 'Waiting for the host to start…' : 'START &nbsp;(Space)';
+  netStatus();
+  if (NET.hosting) NET.room.broadcast({ t: 'lobby', slots: slotState, names: NET.names, map: settings.map === 'random' ? 'random' : settings.map, target: settings.target, cpu: settings.cpu });
 }
 $('cards').addEventListener('click', (e) => {
   const b = e.target.closest('button[data-slot]'); if (!b) return;
   const i = +b.dataset.slot;
-  if (slotState[i] === 'empty') slotState[i] = 'cpu';
+  if (NET.client) return;
+  if (slotState[i] === 'net') { for (const [id, s] of NET.peerSlot) if (s === i) { NET.room.send(id, { t: 'kicked' }); setTimeout(() => NET.room.kick(id), 200); NET.peerSlot.delete(id); } slotState[i] = 'empty'; NET.names[i] = ''; }
+  else if (slotState[i] === 'empty') slotState[i] = 'cpu';
   else { slotState[i] = 'empty'; const pad = padForSlot(i); if (pad) pad.slot = -1; }
   renderLobby();
 });
@@ -460,15 +484,16 @@ document.addEventListener('visibilitychange', () => { if (!ac) return; if (docum
 $('resumeBtn').addEventListener('click', () => setPaused(false));
 $('quitBtn').addEventListener('click', () => toLobby());
 $('rematchBtn').addEventListener('click', () => startMatch());
-$('lobbyBtn').addEventListener('click', () => toLobby());
+$('lobbyBtn').addEventListener('click', () => { if (NET.client) leaveOnline(); else toLobby(); });
 
 function lobbyInput() {
-  SLOTS.forEach((s, i) => { if (anyPressed(s.keys.dash) && slotState[i] !== 'human') { slotState[i] = 'human'; sfx.beep(false); renderLobby(); } });
+  if (NET.client) return;
+  SLOTS.forEach((s, i) => { if (anyPressed(s.keys.dash) && slotState[i] !== 'human' && slotState[i] !== 'net') { slotState[i] = 'human'; sfx.beep(false); renderLobby(); } });
   for (const st of pads.values()) {
     if (st.slot < 0 && padPressed(st, 0)) {
       let i = slotState.findIndex((s, k) => s === 'empty' && !padForSlot(k));
       if (i < 0) i = slotState.findIndex((s, k) => s === 'cpu' && !padForSlot(k));
-      if (i < 0) i = slotState.findIndex((s, k) => !padForSlot(k));
+      if (i < 0) i = slotState.findIndex((s, k) => s !== 'net' && !padForSlot(k));
       if (i >= 0) { st.slot = i; slotState[i] = 'human'; sfx.beep(false); renderLobby(); }
     } else if (st.slot >= 0 && padPressed(st, 1)) { slotState[st.slot] = 'empty'; st.slot = -1; renderLobby(); }
   }
@@ -482,12 +507,16 @@ let state = 'lobby', stateT = 0, roundTime = 0, endPending = -1, collapseT = 0, 
 function show(id, on) { $(id).classList.toggle('hidden', !on); }
 function toLobby() {
   state = 'lobby'; setPaused(false);
+  if (NET.hosting) NET.room.broadcast({ t: 'tolobby' });
   show('lobby', true); show('end', false); show('hud', false); show('help', false); $('big').textContent = '';
   for (const p of players) { scene.remove(p.g.root); scene.remove(p.g.ring); }
   players = []; buildArena(settings.map === 'random' ? mapId : settings.map); clearPickups(); renderLobby();
 }
 function startMatch() {
+  if (NET.client) return;
   createPlayers();
+  NET.ev.length = 0;
+  if (NET.hosting) NET.room.broadcast({ t: 'start', slots: slotState, names: NET.names, map: mapId, target: settings.target });
   show('lobby', false); show('end', false); show('hud', true); show('help', true);
   startRound();
 }
@@ -498,7 +527,7 @@ function startRound() {
     buildArena(pick[(Math.random() * pick.length) | 0]);
     feed(`Map: <b>${MAP.name}</b>`);
   } else if (mapId !== settings.map) buildArena(settings.map);
-  resetTiles(); clearPickups(); placePlayers();
+  resetTiles(); clearPickups(); placePlayers(); emit('round', mapId);
   roundTime = 0; endPending = -1; collapseT = 12;
   state = 'countdown'; stateT = 3; lastBeep = 4;
   renderHud();
@@ -506,6 +535,7 @@ function startRound() {
 let lastBeep = 4;
 function setPaused(v) {
   if (state !== 'play' && state !== 'countdown' && state !== 'roundEnd') v = false;
+  if (v && NET.client) { if (confirm('Leave the online match?')) leaveOnline(); return; }
   paused = v; show('pause', v);
 }
 function eliminate(p) {
@@ -518,7 +548,7 @@ function eliminate(p) {
 function finishRound() {
   const left = players.filter((p) => p.alive && !p.falling);
   const w = left.length === 1 ? left[0] : null;
-  if (w) { w.score++; big(`${w.slot.name} WINS THE ROUND`, w.slot.css, 2.6); sfx.win(); }
+  if (w) { w.score++; big(`${w.slot.name} WINS THE ROUND`, w.slot.css, 2.6); sfx.win(); emit('win'); }
   else big('NOBODY WINS!', '#fff', 2.6);
   state = 'roundEnd'; stateT = 2.6; renderHud();
 }
@@ -526,8 +556,9 @@ function showMatchEnd() {
   const w = players.reduce((a, b) => (b.score > a.score ? b : a));
   state = 'end'; show('end', true); show('help', false); $('big').textContent = '';
   $('endTitle').textContent = `${w.slot.name} IS THE CHAMPION!`; $('endTitle').style.cssText = `font-size:clamp(36px,7vw,72px);color:${w.slot.css};background:none;-webkit-text-fill-color:${w.slot.css}`;
-  $('endStats').innerHTML = players.map((p) => `<div style="--c:${p.slot.css}"><b>${p.slot.name}${p.cpu ? ' (CPU)' : ''}</b>${p.score} rounds · ${p.kos} bonk-offs</div>`).join('');
+  $('endStats').innerHTML = players.map((p) => `<div style="--c:${p.slot.css}"><b>${who(p)}</b>${p.score} rounds · ${p.kos} bonk-offs</div>`).join('');
   sfx.win();
+  emit('end', $('endTitle').textContent, w.slot.css, $('endStats').innerHTML);
 }
 
 // ---------------- simulation ----------------
@@ -586,7 +617,7 @@ function simulate(dt) {
       if (l < 0.2) { dx = Math.sin(p.face); dz = Math.cos(p.face); l = 1; }
       p.vx += dx / l * 14 * spd; p.vz += dz / l * 14 * spd;
       p.dashCd = p.zoom > 0 ? 0.4 : 0.75; p.dashT = 0.24; p.sq = 0.8;
-      sfx.dash(); burst(p.x, 0.2, p.z, 0xffffff, 6, 2.5);
+      sfx.dash(); burst(p.x, 0.2, p.z, 0xffffff, 6, 2.5); emit('dash', p.i);
     }
     const fr = Math.exp(-(p.dashT > 0 ? dashGrip : grip) * dt); p.vx *= fr; p.vz *= fr;
     p.x += p.vx * dt; p.z += p.vz * dt;
@@ -594,7 +625,7 @@ function simulate(dt) {
     if (sp > 0.6) { let d = Math.atan2(p.vx, p.vz) - p.face; d = Math.atan2(Math.sin(d), Math.cos(d)); p.face += d * Math.min(1, 12 * dt); }
     const target = p.mega > 0 ? 1.6 : 1; p.scale += (target - p.scale) * Math.min(1, 8 * dt);
     p.teeter = !solid(p.x, p.z);
-    if (!supported(p.x, p.z)) { p.falling = true; p.vy = 2; sfx.fall(); p.g.ring.visible = false; }
+    if (!supported(p.x, p.z)) { p.falling = true; p.vy = 2; sfx.fall(); p.g.ring.visible = false; emit('fall', p.i); }
   }
   // blob vs bumper posts
   for (const t of bumpers) {
@@ -610,7 +641,7 @@ function simulate(dt) {
       const out = p.vx * nx + p.vz * nz, kick = Math.max(0, 11 - out);
       p.vx += nx * kick; p.vz += nz * kick;
       p.sq = 0.8; t.bump = 1;
-      tone(520, 0.18, 'sine', 0.2, 900); burst(t.x + nx * 0.5, 0.6, t.z + nz * 0.5, 0xff3d9a, 8, 4);
+      tone(520, 0.18, 'sine', 0.2, 900); burst(t.x + nx * 0.5, 0.6, t.z + nz * 0.5, 0xff3d9a, 8, 4); emit('bump', tiles.indexOf(t), +(t.x + nx * 0.5).toFixed(2), +(t.z + nz * 0.5).toFixed(2));
     }
   }
   // blob vs blob
@@ -633,6 +664,7 @@ function simulate(dt) {
     A.hitT = B.hitT = 0.3; A.sq = B.sq = Math.min(1, str / 10);
     sfx.bonk(str);
     const cx = A.x + nx * 0.55 * A.scale, cz = A.z + nz * 0.55 * A.scale;
+    emit('bonk', A.i, B.i, +str.toFixed(1), +cx.toFixed(2), +cz.toFixed(2));
     burst(cx, 0.6, cz, A.slot.color, 5 + (str | 0) / 2, 3 + str * 0.25); burst(cx, 0.6, cz, B.slot.color, 5 + (str | 0) / 2, 3 + str * 0.25);
     if (str > 12) shake = Math.max(shake, Math.min(0.5, str * 0.025));
     if (str > 12) hitStop = Math.max(hitStop, Math.min(0.09, 0.03 + str * 0.002)); // big bonks land with a beat of freeze
@@ -649,7 +681,7 @@ function simulate(dt) {
 
 const WARN_RED = new THREE.Color(0xff3b3b);
 function updateTiles(dt) {
-  if (state === 'play') {
+  if (state === 'play' && !NET.client) {
     const okCount = updateCentroid();
     collapseT -= dt;
     const floor = roundTime > 75 ? 1 : 7;
@@ -722,6 +754,7 @@ function render(dt, time) {
 let last = performance.now();
 function frame(now) {
   const raw = (now - last) / 1000, dt = Math.min(0.05, raw); last = now;
+  if (NET.client) { clientFrame(dt, now); return; }
   if (state !== 'lobby' && !paused && settings.autoRes) gov.tick(raw);
   pollPads();
   const escape = pressed.has('Escape') || anyPadPressed(9);
@@ -740,8 +773,8 @@ function frame(now) {
     if (state === 'countdown') {
       stateT -= dt;
       const n = Math.ceil(stateT);
-      if (n !== lastBeep && n > 0) { lastBeep = n; big(String(n), '#fff', 1); sfx.beep(false); }
-      if (stateT <= 0) { state = 'play'; big('BONK!', '#ffc62e', 0.8); sfx.beep(true); }
+      if (n !== lastBeep && n > 0) { lastBeep = n; big(String(n), '#fff', 1); sfx.beep(false); emit('beep', 0); }
+      if (stateT <= 0) { state = 'play'; big('BONK!', '#ffc62e', 0.8); sfx.beep(true); emit('beep', 1); }
     } else if (state === 'play') {
       roundTime += dt;
       pickTimer -= dt;
@@ -756,13 +789,194 @@ function frame(now) {
     if (hitStop > 0) { hitStop -= dt; sdt = 0; } else if (slowT > 0) { slowT -= dt; sdt = dt * 0.35; }
     if (sdt > 0) { simulate(sdt); updateTiles(sdt); }
   }
+  if (NET.hosting && NET.room.conns.size && state !== 'lobby') { NET.snapT -= dt; if (NET.snapT <= 0) { NET.snapT = 0.05; sendSnap(); } }
   if (bigTimer > 0) { bigTimer -= dt; if (bigTimer <= 0) $('big').textContent = ''; }
   render(paused || hitStop > 0 ? 0 : slowT > 0 ? dt * 0.35 : dt, now / 1000);
   pressed.clear();
   requestAnimationFrame(frame);
 }
+// ---------------- online play ----------------
+const r2 = (v) => Math.round(v * 100) / 100;
+const TILE_CH = { ok: 'o', warn: 'w', gone: 'g' };
+function sendSnap() {
+  NET.room.broadcast({ t: 's', st: state, mp: mapId, pl: players.map((p) => [p.i, r2(p.x), r2(p.y), r2(p.z), r2(p.vx), r2(p.vz), r2(p.face), (p.alive ? 1 : 0) | (p.falling ? 2 : 0) | (p.teeter ? 4 : 0) | (p.mega > 0 ? 8 : 0) | (p.zoom > 0 ? 16 : 0) | (p.dashCd > 0 ? 32 : 0), r2(p.scale), p.score, p.kos]),
+    ti: tiles.map((t) => TILE_CH[t.state]).join(''), pk: pickups.map((k) => [k.type, r2(k.x), r2(k.z), r2(k.t)]), ev: NET.ev.splice(0) });
+}
+function onHostMsg(id, m) {
+  if (!m || typeof m !== 'object') return;
+  const slot = NET.peerSlot.get(id);
+  if (m.t === 'in' && slot !== undefined) {
+    const n = NET.input[slot] || (NET.input[slot] = { x: 0, y: 0, dash: false });
+    n.x = Math.max(-1, Math.min(1, +m.x || 0)); n.y = Math.max(-1, Math.min(1, +m.y || 0)); if (m.d) n.dash = true;
+  }
+}
+function onPeerJoin(id, name) {
+  const free = slotState.findIndex((s) => s === 'empty');
+  const slot = free >= 0 ? free : slotState.findIndex((s) => s === 'cpu');
+  if (slot < 0 || state !== 'lobby') { NET.room.send(id, { t: 'full', why: state !== 'lobby' ? 'The match already started. Ask the host to go back to the lobby.' : 'The room is full.' }); setTimeout(() => NET.room.kick(id), 300); return; }
+  NET.peerSlot.set(id, slot); slotState[slot] = 'net'; NET.names[slot] = String(name).slice(0, 16); NET.input[slot] = { x: 0, y: 0, dash: false };
+  NET.room.send(id, { t: 'welcome', slot });
+  sfx.beep(false); feed(`🌐 <b>${esc(NET.names[slot])}</b> joined`);
+  renderLobby();
+}
+function onPeerLeave(id) {
+  const slot = NET.peerSlot.get(id); if (slot === undefined) return;
+  NET.peerSlot.delete(id);
+  feed(`🌐 <b>${esc(NET.names[slot] || 'A friend')}</b> left`);
+  if (state === 'lobby') { slotState[slot] = 'empty'; NET.names[slot] = ''; renderLobby(); }
+  else { slotState[slot] = 'cpu'; const p = players.find((q) => q.i === slot); if (p) { p.cpu = true; p.net = false; } renderHud(); } // a CPU takes over mid-match
+}
+// ---- a friend's browser: draw what the host sends
+function onClientMsg(id, m) {
+  if (!m || typeof m !== 'object') return;
+  if (m.t === 'welcome') { NET.mySlot = m.slot; netStatus(); }
+  else if (m.t === 'lobby') { for (let i = 0; i < 3; i++) slotState[i] = m.slots[i]; NET.names = m.names; settings.target = m.target; if (state === 'lobby') { if (m.map !== 'random' && MAPS[m.map] && mapId !== m.map) buildArena(m.map); renderLobby(); } }
+  else if (m.t === 'start') { for (let i = 0; i < 3; i++) slotState[i] = m.slots[i]; NET.names = m.names; settings.target = m.target; if (MAPS[m.mp || m.map]) buildArena(m.mp || m.map); createPlayers(); placePlayers(); show('lobby', false); show('end', false); show('hud', true); show('help', false); state = 'countdown'; renderHud(); }
+  else if (m.t === 'tolobby') { clientToLobby(); }
+  else if (m.t === 'full') { alert(m.why || 'The room is full.'); leaveOnline(); }
+  else if (m.t === 'kicked') { alert('The host removed you from the room.'); leaveOnline(); }
+  else if (m.t === 's') NET.snap = m;
+}
+function clientToLobby() {
+  state = 'lobby'; show('lobby', true); show('end', false); show('hud', false); show('help', false); $('big').textContent = '';
+  for (const p of players) { scene.remove(p.g.root); scene.remove(p.g.ring); }
+  players = []; clearPickups(); resetTiles(); renderLobby();
+}
+const pickMeshes = [];
+function applySnap(s, dt) {
+  if (s.mp !== mapId && MAPS[s.mp]) { buildArena(s.mp); }
+  if (state !== s.st) { if (s.st === 'end') show('help', false); state = s.st; }
+  for (const e of s.ev || []) clientEvent(e);
+  s.ev = [];
+  // blobs: ease toward the host's positions (and lead them by their speed a little)
+  const k = Math.min(1, dt * 18);
+  for (const a of s.pl) {
+    const p = players.find((q) => q.i === a[0]); if (!p) continue;
+    const f = a[7], alive = !!(f & 1), falling = !!(f & 2);
+    if (alive && !p.alive) { p.g.root.visible = true; p.g.ring.visible = true; p.x = a[1]; p.z = a[3]; }
+    p.x += (a[1] + a[4] * 0.03 - p.x) * k; p.y += (a[2] - p.y) * k; p.z += (a[3] + a[5] * 0.03 - p.z) * k;
+    p.vx = a[4]; p.vz = a[5];
+    let d = a[6] - p.face; d = Math.atan2(Math.sin(d), Math.cos(d)); p.face += d * k;
+    p.alive = alive; p.falling = falling; p.teeter = !!(f & 4); p.mega = f & 8 ? 1 : 0; p.zoom = f & 16 ? 1 : 0; p.dashCd = f & 32 ? 1 : 0;
+    p.scale = a[8];
+    if (p.score !== a[9] || p.kos !== a[10]) { p.score = a[9]; p.kos = a[10]; renderHud(); }
+    if (!alive) p.g.root.visible = false;
+  }
+  // tiles: start warning / falling when the host says so (the falling itself is animated here)
+  for (let i = 0; i < tiles.length && i < s.ti.length; i++) {
+    const t = tiles[i], c = s.ti[i];
+    if (c === 'o' && t.state !== 'ok') { t.state = 'ok'; t.t = 0; t.vy = 0; t.mesh.position.set(t.x, 0, t.z); t.mesh.rotation.set(0, 0, 0); t.mesh.visible = true; t.top.color.copy(t.base); }
+    else if (c === 'w' && t.state === 'ok') { t.state = 'warn'; t.t = 1.3; }
+    else if (c === 'g' && t.state !== 'gone') { t.state = 'warn'; t.t = 0; }
+  }
+  // pickups
+  while (pickMeshes.length > s.pk.length) scene.remove(pickMeshes.pop().mesh);
+  s.pk.forEach((q, i) => {
+    let m = pickMeshes[i];
+    if (!m || m.type !== q[0]) { if (m) scene.remove(m.mesh); const mesh = new THREE.Mesh(PICK[q[0]].geo, new THREE.MeshStandardMaterial({ color: PICK[q[0]].color, emissive: PICK[q[0]].color, emissiveIntensity: 0.6, roughness: 0.3 })); scene.add(mesh); m = pickMeshes[i] = { type: q[0], mesh, x: q[1], z: q[2], t: q[3] }; }
+    m.x = q[1]; m.z = q[2]; m.t = q[3]; m.mesh.position.x = q[1]; m.mesh.position.z = q[2];
+  });
+  pickups = pickMeshes;
+}
+function clientEvent(e) {
+  const [type, ...a] = e, P = (i) => players.find((q) => q.i === i);
+  if (type === 'dash') { const p = P(a[0]); sfx.dash(); if (p) { burst(p.x, 0.2, p.z, 0xffffff, 6, 2.5); p.sq = 0.8; } }
+  else if (type === 'fall') { sfx.fall(); const p = P(a[0]); if (p) p.g.ring.visible = false; }
+  else if (type === 'bump') { tone(520, 0.18, 'sine', 0.2, 900); burst(a[1], 0.6, a[2], 0xff3d9a, 8, 4); const t = tiles[a[0]]; if (t) t.bump = 1; }
+  else if (type === 'bonk') { const A = P(a[0]), B = P(a[1]), str = a[2]; sfx.bonk(str); if (A && B) { A.sq = B.sq = Math.min(1, str / 10); burst(a[3], 0.6, a[4], A.slot.color, 5 + (str | 0) / 2, 3 + str * 0.25); burst(a[3], 0.6, a[4], B.slot.color, 5 + (str | 0) / 2, 3 + str * 0.25); } if (str > 12) { shake = Math.max(shake, Math.min(0.5, str * 0.025)); hitStop = Math.max(hitStop, Math.min(0.09, 0.03 + str * 0.002)); } }
+  else if (type === 'grab') { sfx.pickup(); burst(a[1], 0.7, a[2], PICK[a[0]].color, 14, 5); if (a[0] === 'quake') { sfx.quake(); shake = 0.6; const p = P(a[3]); if (p) shockwave(p.x, p.z, PICK.quake.color); } }
+  else if (type === 'feed') { const d = document.createElement('div'); d.innerHTML = a[0]; $('feed').appendChild(d); setTimeout(() => d.remove(), 3500); }
+  else if (type === 'big') { const b = $('big'); b.textContent = a[0]; b.style.color = a[1]; bigTimer = a[2]; b.classList.add('pop'); setTimeout(() => b.classList.remove('pop'), 120); }
+  else if (type === 'beep') sfx.beep(!!a[0]);
+  else if (type === 'win') sfx.win();
+  else if (type === 'round') { if (MAPS[a[0]] && a[0] !== mapId) buildArena(a[0]); resetTiles(); for (const p of players) { p.alive = true; p.falling = false; p.g.root.visible = true; p.g.ring.visible = true; p.g.root.rotation.x = 0; } renderHud(); }
+  else if (type === 'end') { show('end', true); $('endTitle').textContent = a[0]; $('endTitle').style.cssText = `font-size:clamp(36px,7vw,72px);color:${a[1]};background:none;-webkit-text-fill-color:${a[1]}`; $('endStats').innerHTML = a[2]; $('rematchBtn').classList.add('hidden'); $('lobbyBtn').textContent = 'Leave'; sfx.win(); }
+}
+let hitStopC = 0;
+function clientFrame(dt, now) {
+  pollPads();
+  if (pressed.has('Escape') && state !== 'lobby') setPaused(true);
+  if (state !== 'lobby') {
+    const inp = clientInput(); if (inp.dash) NET.dashQ = true;
+    NET.sendT -= dt;
+    if (NET.sendT <= 0) { NET.sendT = 1 / 30; NET.room.send('h', { t: 'in', x: +inp.x.toFixed(2), y: +inp.y.toFixed(2), d: NET.dashQ }); NET.dashQ = false; }
+  }
+  if (NET.snap && state !== 'lobby') applySnap(NET.snap, dt);
+  for (const p of players) p.sq *= Math.exp(-8 * dt);
+  if (state !== 'lobby') updateTiles(dt); // only animates here (the host decides which tiles go)
+  if (bigTimer > 0) { bigTimer -= dt; if (bigTimer <= 0) $('big').textContent = ''; }
+  render(hitStop > 0 ? 0 : dt, now / 1000);
+  if (hitStop > 0) hitStop -= dt;
+  pressed.clear();
+  requestAnimationFrame(frame);
+}
+// ---- the Online panel
+function netStatus() {
+  const el = $('netStatus'); if (!el) return;
+  if (NET.hosting) el.innerHTML = `🌐 Room <b>${NET.room.code}</b> · ${NET.room.conns.size} friend${NET.room.conns.size === 1 ? '' : 's'} online`;
+  else if (NET.client) el.innerHTML = `🌐 In room <b>${NET.room.code}</b>${NET.mySlot >= 0 ? ' as ' + SLOTS[NET.mySlot].name : ''} · move with WASD or the arrows, dash with Space / Q`;
+  else el.textContent = '';
+  $('onlineBtn').textContent = NET.hosting || NET.client ? '🌐 Online ✓' : '🌐 Online';
+}
+function leaveOnline() {
+  if (NET.room) NET.room.close();
+  const wasClient = NET.client;
+  NET.room = null; NET.hosting = false; NET.client = false; NET.peerSlot.clear(); NET.mySlot = -1; NET.snap = null; NET.names = ['', '', ''];
+  for (let i = 0; i < 3; i++) if (slotState[i] === 'net' || wasClient) slotState[i] = 'empty';
+  $('rematchBtn').classList.remove('hidden'); $('lobbyBtn').textContent = 'Lobby (Esc)';
+  if (wasClient) { pickMeshes.forEach((m) => scene.remove(m.mesh)); pickMeshes.length = 0; pickups = []; clientToLobby(); }
+  else if (state !== 'lobby') toLobby(); else renderLobby();
+  drawNet();
+}
+function drawNet(msg = '') {
+  const box = $('netBody');
+  const name = esc(store.get('name', ''));
+  if (NET.hosting) {
+    const link = location.origin + location.pathname + '?join=' + NET.room.code;
+    box.innerHTML = `<p>Your room code:</p><div class="netCode">${NET.room.code}</div><p class="small">Friends open Bonk Bowl, press 🌐 Online and enter the code, or open this link:</p>
+      <input class="netLink" readonly value="${link}"><div class="row"><button id="netCopy">Copy link</button><button id="netClose">Close room</button></div>
+      <p class="small">Friends take the free slots. You can still add CPUs and local players.</p>`;
+    $('netCopy').onclick = () => { navigator.clipboard?.writeText(link).then(() => ($('netCopy').textContent = 'Copied'), () => {}); };
+    $('netClose').onclick = () => leaveOnline();
+  } else if (NET.client) {
+    box.innerHTML = `<p>You're in room <b>${NET.room.code}</b>. The host starts the match.</p><div class="row"><button id="netLeave">Leave room</button></div>`;
+    $('netLeave').onclick = () => leaveOnline();
+  } else {
+    box.innerHTML = `<label class="netName">Your name <input id="netName" maxlength="16" value="${name}" placeholder="Player"></label>
+      <div class="row"><button id="netHost">Host a room</button></div>
+      <p class="small" style="margin-top:6px">or join a friend's room:</p>
+      <div class="row"><input id="netCodeIn" maxlength="4" placeholder="CODE" autocomplete="off"><button id="netJoin">Join</button></div>
+      <p class="netMsg">${msg}</p>`;
+    const nm = () => { const v = $('netName').value.trim().slice(0, 16) || 'Player'; store.set('name', v); return v; };
+    for (const el of [$('netName'), $('netCodeIn')]) { el.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter' && el.id === 'netCodeIn') $('netJoin').click(); }); el.addEventListener('keyup', (e) => e.stopPropagation()); }
+    $('netHost').onclick = async () => {
+      nm(); $('netHost').disabled = true; box.querySelector('.netMsg').textContent = 'Opening a room…';
+      const room = new Room();
+      try { await room.hostRoom(); } catch (err) { drawNet(err.message); return; }
+      NET.room = room; NET.hosting = true;
+      room.onJoin = onPeerJoin; room.onLeave = onPeerLeave; room.onMsg = onHostMsg;
+      drawNet(); renderLobby();
+    };
+    $('netJoin').onclick = async () => {
+      const code = $('netCodeIn').value.toUpperCase().replace(/[^A-Z]/g, '');
+      if (code.length !== 4) { box.querySelector('.netMsg').textContent = 'Codes are 4 letters.'; return; }
+      $('netJoin').disabled = true; box.querySelector('.netMsg').textContent = 'Connecting…';
+      const room = new Room();
+      try { await room.join(code, nm()); } catch (err) { drawNet(err.message); return; }
+      NET.room = room; NET.client = true;
+      room.onMsg = onClientMsg; room.onLost = () => { alert('Lost the connection to the host.'); leaveOnline(); };
+      for (let i = 0; i < 3; i++) slotState[i] = 'empty';
+      drawNet(); renderLobby(); show('netPanel', false); show('lobby', true);
+    };
+  }
+}
+$('onlineBtn').addEventListener('click', () => { show('lobby', false); show('netPanel', true); drawNet(); });
+$('netDone').addEventListener('click', () => { show('netPanel', false); show('lobby', true); renderLobby(); });
+addEventListener('beforeunload', () => { if (NET.room) NET.room.close(); });
+{ const j = new URLSearchParams(location.search).get('join'); if (j) setTimeout(() => { $('onlineBtn').click(); const el = $('netCodeIn'); if (el) el.value = j.toUpperCase().slice(0, 4); }, 300); }
+
 if (settings.map !== 'random' && !MAPS[settings.map]) settings.map = 'meadow';
 buildArena(settings.map === 'random' ? 'meadow' : settings.map);
 renderLobby();
 requestAnimationFrame(frame);
-if (location.search.includes('test')) window.__bb = { info: () => ({ map: mapId, state, roundTime: +roundTime.toFixed(1), gone: tiles.filter((t) => t.state === 'gone').length, scores: players.map((p) => p.score), alive: players.map((p) => p.alive) }) };
+if (location.search.includes('test')) window.__bb = { info: () => ({ map: mapId, state, roundTime: +roundTime.toFixed(1), gone: tiles.filter((t) => t.state === 'gone').length, scores: players.map((p) => p.score), alive: players.map((p) => p.alive), pos: players.map((p) => [p.i, Math.round(p.x * 100) / 100, Math.round(p.z * 100) / 100]), net: NET.hosting ? 'host' : NET.client ? 'client' : '' }) };

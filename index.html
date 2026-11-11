@@ -57,11 +57,19 @@
   .setbox label { display:grid; grid-template-columns:1fr auto; gap:6px; font-weight:800; text-align:left; }
   .setbox output { color:var(--gold); }
   .setbox input[type=range] { grid-column:1 / -1; width:100%; accent-color:var(--gold); }
+  .netCode { font: 900 44px/1 "Segoe UI", system-ui, sans-serif; letter-spacing: 8px; color: var(--gold); text-align: center; }
+  .netLink, #netCodeIn, #netName { font: inherit; padding: 8px 10px; border-radius: 10px; border: 2px solid #ffffff33; background: #0e0c24; color: #fff; }
+  .netLink { width: 100%; font-size: 13px; }
+  #netCodeIn { width: 110px; text-transform: uppercase; letter-spacing: 4px; font-weight: 900; text-align: center; }
+  .netName { display: flex; gap: 10px; align-items: center; justify-content: center; font-weight: 800; }
+  .netMsg { min-height: 1.2em; color: var(--gold); margin: 4px 0 0; }
+  #netDone { font-size: 18px; padding: 10px 28px; }
   #setDone { font-size:18px; padding:10px 28px; background:linear-gradient(90deg,#ff4d5e,#ff8a3d); }
   .stats { display:flex; gap:14px; flex-wrap:wrap; justify-content:center; }
   .stats div { background:var(--panel); border-radius:14px; padding:10px 18px; border:2px solid var(--c); }
   .stats b { color:var(--c); display:block; font-size:20px; }
 </style>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>
@@ -86,7 +94,9 @@
     <span style="width:12px"></span>
     <button id="ctrlToggle">Controllers: ON</button>
     <button id="setBtn">⚙ Settings</button>
+    <button id="onlineBtn">🌐 Online</button>
   </div>
+  <div id="netStatus" class="small" style="opacity:.9"></div>
   <button id="startBtn">START &nbsp;(Space)</button>
     <button id="installApp" style="display:none">Install as an app</button>
     <button id="pcDownload" title="The Game Library app for Windows: every game in one place">Download for PC</button>
@@ -101,6 +111,13 @@
 <div id="pause" class="overlay hidden">
   <h1 style="font-size:64px">PAUSED</h1>
   <div class="row"><button id="resumeBtn">Resume (Esc)</button><button id="pSetBtn">⚙ Settings</button><button id="quitBtn">Quit to lobby (Backspace)</button></div>
+</div>
+
+<div id="netPanel" class="overlay hidden">
+  <h1 style="font-size:clamp(36px,6vw,64px)">ONLINE</h1>
+  <p class="tag" style="font-size:15px">Play with friends on their own computers. One of you hosts, the others join with the code.</p>
+  <div class="setbox" id="netBody"></div>
+  <button id="netDone">Back to the lobby</button>
 </div>
 
 <div id="setPanel" class="overlay hidden">

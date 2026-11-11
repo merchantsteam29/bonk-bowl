@@ -1,5 +1,16 @@
 [
   {
+    "version": "1.3",
+    "date": "2026-11-11",
+    "title": "Online",
+    "notes": [
+      "Play online: press 🌐 Online in the lobby. One of you hosts and shares the 4-letter code (or the link); friends join from their own computers.",
+      "Friends take the free slots; the host can still add CPUs and local players on the same keyboard.",
+      "If a friend drops out mid-match, a CPU takes over their blob.",
+      "Settings: volume, screen shake, auto resolution and fullscreen. Big bonks freeze for a split second and the winning knock-off plays in slow motion."
+    ]
+  },
+  {
     "version": "1.2",
     "date": "2026-11-09",
     "title": "Install as an app",
