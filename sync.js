@@ -105,6 +105,10 @@
 
   async function receive(bytes) {
     let doc; try { doc = await open(bytes); } catch { return; } // not ours / damaged
+    if (doc && doc.moved) { // this account was moved to a new code (or deleted) after this device signed in
+      if (acc && (acc.since || 0) < (doc.t || 0)) { stop(); note('Your account changed on another device (new password or gamertag, or it was deleted). Sign in again in the Game Library.'); }
+      return;
+    }
     if (!doc || doc.game !== cfg.game || !doc.keys) return;
     snapshot();
     let changed = false;
@@ -177,21 +181,35 @@
     const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: te.encode('mmgames-account-v1:' + String(tag).toLowerCase()), iterations: 250000 }, base, 160));
     return fmt([...bits].map((x) => ALPHA[x & 31]).join(''));
   }
-  // a retained message on the relays, or null after a short wait
-  async function peek(topic, ms = 3500) {
-    const clients = await lbConnect();
-    return new Promise((res) => {
-      let done = false;
-      const fin = (v) => { if (done) return; done = true; for (const c of clients) { c.unsubscribe(topic); c.removeListener('message', on); } res(v); };
-      const on = (t, msg) => { if (t === topic && msg && msg.length) fin(new Uint8Array(msg)); };
-      for (const c of clients) { c.on('message', on); c.subscribe(topic, { qos: 1 }); }
-      setTimeout(() => fin(null), ms);
-    });
+  // Every retained message under a topic (or a filter with + / #), as bytes. The MQTT library skips a second
+  // subscribe to a topic it's already subscribed to (so the relay never re-sends the retained message), and the
+  // first reader to finish would unsubscribe the other: lookups of the same topic at the same time share one.
+  const inflight = new Map();
+  function collectRaw(filter, ms = 2600) {
+    let p = inflight.get(filter);
+    if (!p) {
+      p = (async () => {
+        const clients = await lbConnect(), got = new Map(), exact = !/[+#]/.test(filter), base = filter.replace(/[+#].*$/, '');
+        const on = (t, msg) => { if ((exact ? t === filter : t.startsWith(base)) && msg && msg.length) got.set(t, new Uint8Array(msg)); };
+        for (const c of clients) { c.on('message', on); c.subscribe(filter, { qos: 1 }); }
+        const t0 = Date.now();
+        while (Date.now() - t0 < ms && !(exact && got.size)) await new Promise((r) => setTimeout(r, 60));
+        for (const c of clients) { c.unsubscribe(filter); c.removeListener('message', on); }
+        return got;
+      })();
+      inflight.set(filter, p); p.finally(() => inflight.delete(filter)).catch(() => {});
+    }
+    return p;
   }
-  async function post(topic, body) {
+  // a retained message on the relays, or null after a short wait
+  const peek = async (topic, ms = 3500) => (await collectRaw(topic, ms)).get(topic) || null;
+  // a retained message on both relays; waits until they confirm it (or a few seconds, if one is down: it's sent when it's back)
+  async function post(topic, body, wait = 6000) {
     const clients = await lbConnect();
-    const send = (c) => c.publish(topic, body, { qos: 1, retain: true });
-    for (const c of clients) { if (c.connected) send(c); else c.once('connect', () => send(c)); }
+    await Promise.all(clients.map((c) => new Promise((r) => {
+      const t = setTimeout(r, wait), send = () => c.publish(topic, body, { qos: 1, retain: true }, () => { clearTimeout(t); r(); });
+      if (c.connected) send(); else c.once('connect', send);
+    })));
   }
   // has this code ever synced the given game? 'ok' (and it opens with this code) or 'none'
   async function probe(code, game) {
@@ -199,13 +217,13 @@
     const key = await crypto.subtle.importKey('raw', await sha('key:' + c), 'AES-GCM', false, ['decrypt']);
     const bytes = await peek(TOPIC + id + '/' + game);
     if (!bytes) return 'none';
-    try { await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.slice(0, 12) }, key, bytes.slice(12)); return 'ok'; } catch { return 'none'; }
+    try { const d = JSON.parse(td.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.slice(0, 12) }, key, bytes.slice(12)))); return d && d.moved ? 'moved' : 'ok'; } catch { return 'none'; }
   }
   // gamertags: a public marker per tag (hashed) so a new account doesn't pick a tag someone has
   const TAGS = 'mmgames/v1/tag/';
   const tagTopic = async (tag) => TAGS + hex(await sha('tag:' + String(tag).toLowerCase())).slice(0, 32);
   const tagTaken = async (tag) => !!(await peek(await tagTopic(tag), 3000));
-  const claimTag = async (tag) => post(await tagTopic(tag), JSON.stringify({ t: Date.now() }));
+  const claimTag = async (tag, code) => { const k = await idKey(code || (acc && acc.code)); return post(await tagTopic(tag), JSON.stringify({ t: Date.now(), x: k.x, y: k.y })); };
   function signIn(code, tag, mode) {
     if (acc) { disconnect(); }
     start(code, mode === 'new' ? 'new' : 'join');
@@ -213,7 +231,130 @@
     if (tag) ls.set('gamesync.name', tag.slice(0, 16));
     if (mode === 'new') schedulePush(400);
     setStatus(status);
+    if (tag) setTimeout(() => { ping().catch(() => {}); backfillClaim().catch(() => {}); }, 1500);
   }
+
+  // ---------- account identity ----------
+  // A signing key made from the sync code (so every device and game with the account has it, and nothing
+  // extra is stored). Its public half sits in the gamertag's marker. Profiles, "online" pings, leaderboard
+  // rows and reports are signed with it, so nobody can post as someone else.
+  const P8 = [0x30, 0x41, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x27, 0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20];
+  const idKeys = new Map();
+  function idKey(code) {
+    const c = clean(code);
+    if (!idKeys.has(c)) idKeys.set(c, (async () => {
+      const der = new Uint8Array(P8.length + 32); der.set(P8); der.set(await sha('acct-sign:' + c), P8.length);
+      const key = await crypto.subtle.importKey('pkcs8', der, EC, true, ['sign']), j = await crypto.subtle.exportKey('jwk', key);
+      return { key, x: j.x, y: j.y };
+    })());
+    return idKeys.get(c);
+  }
+  const myId = async () => (acc && acc.tag ? idKey(acc.code) : null);
+  const verifyRaw = async (sig, msg, x, y) => { try { return await crypto.subtle.verify(SIG, await verifyKey(x, y), ub(sig), te.encode(msg)); } catch { return false; } };
+  // several retained messages at once (null for the ones that aren't there)
+  async function grab(topics, ms = 2200) {
+    const got = new Map();
+    await Promise.all([...new Set(topics)].map(async (t) => { const b = (await collectRaw(t, ms)).get(t); if (b) got.set(t, td.decode(b)); }));
+    return got;
+  }
+
+  // ---------- public profiles and who's online ----------
+  const PRO = 'mmgames/v1/pro/', ON = 'mmgames/v1/on/';
+  const hashT = async (kind, tag) => hex(await sha(kind + ':' + String(tag).toLowerCase())).slice(0, 32);
+  const proTopic = async (tag) => PRO + await hashT('pro', tag), onTopic = async (tag) => ON + await hashT('on', tag);
+  // lower(tag) -> { tag, x, y, profile, on } (x missing: no such account, or one from before profiles)
+  const peopleCache = new Map();
+  async function people(tags, force) {
+    const out = new Map(), need = [];
+    for (const t of new Set(tags.map(String))) { const c = peopleCache.get(t.toLowerCase()); if (c && !force && Date.now() - c.at < 90000) out.set(t.toLowerCase(), c.v); else need.push(t); }
+    if (!need.length) return out;
+    const tops = await Promise.all(need.map(async (t) => [t, await tagTopic(t), await proTopic(t), await onTopic(t)]));
+    const got = await grab(tops.flatMap((x) => x.slice(1)), 2400);
+    for (const [t, ct, pt, ot] of tops) {
+      const claim = jparse(got.get(ct) || ''), v = { tag: t, claimed: !!claim, x: claim && claim.x, y: claim && claim.y, profile: null, on: null };
+      if (v.x) {
+        const p = await verify(jparse(got.get(pt) || ''), v.x, v.y); if (p && lower(p.tag) === lower(t)) { v.profile = p; v.tag = p.tag; }
+        const o = await verify(jparse(got.get(ot) || ''), v.x, v.y); if (o && lower(o.tag) === lower(t)) v.on = o;
+      }
+      peopleCache.set(t.toLowerCase(), { at: Date.now(), v }); out.set(t.toLowerCase(), v);
+    }
+    return out;
+  }
+  async function postSigned(topic, obj) { const k = await myId(); if (!k) return false; await post(topic, JSON.stringify(await sign(k, obj))); return true; }
+  // the library publishes what others see: picture, banner, achievements
+  async function setProfile(p) { if (!acc || !acc.tag) return false; peopleCache.delete(lower(acc.tag)); return postSigned(await proTopic(acc.tag), { ...p, tag: myName(), t: Date.now() }); }
+  // "online": every game (and the library) says what you're playing every couple of minutes
+  async function ping() { if (!acc || !acc.tag || !cfg) return false; return postSigned(await onTopic(acc.tag), { tag: myName(), game: cfg.game, title: cfg.title || String(document.title || '').split(/ [—|-] /)[0].slice(0, 40), t: Date.now() }); }
+  // accounts made before profiles: put the account's key on its gamertag
+  async function backfillClaim() {
+    if (!acc || !acc.tag) return;
+    const i = (await people([acc.tag], true)).get(lower(acc.tag));
+    if (i && !i.x) await claimTag(acc.tag, acc.code);
+  }
+
+  // ---------- friends (a list of gamertags, synced by the library) ----------
+  const friends = () => { const v = jget('gamelib.friends', []); return Array.isArray(v) ? v.filter((t) => typeof t === 'string') : []; };
+  function setFriends(list) {
+    const l = [...new Map(list.map((t) => [lower(t), t])).values()].slice(0, 200);
+    jset('gamelib.friends', l); try { window.gameLib && window.gameLib.setFriends && window.gameLib.setFriends(l); } catch { /* not in the PC app */ }
+    return l;
+  }
+  const isFriend = (t) => friends().some((f) => lower(f) === lower(t));
+
+  // ---------- reports: a signed-in player flags a leaderboard score for the staff ----------
+  async function report(r, game, board, reason) {
+    const k = await myId(); if (!k) throw new Error('Sign in to report');
+    const topic = MOD + 'rep/' + await short('rep:' + lower(acc.tag));
+    const old = await verify(jparse((await grab([topic], 1800)).get(topic) || ''), k.x, k.y);
+    const list = (old && Array.isArray(old.list) ? old.list : []).filter((x) => !(x.pid === r.pid && x.game === game && x.board === board));
+    list.push({ id: hex(crypto.getRandomValues(new Uint8Array(6))), game, board, pid: r.pid, name: r.n, s: r.s, reason: String(reason || '').slice(0, 120), t: Date.now() });
+    await post(topic, JSON.stringify(await sign(k, { tag: myName(), list: list.slice(-30), t: Date.now() })));
+  }
+  async function reports() {
+    const envs = [...(await collect(MOD + 'rep/+', 2600)).values()].map(jparse).filter((e) => e && typeof e.p === 'string');
+    const tagOf = (e) => (jparse(e.p) || {}).tag, info = await people(envs.map(tagOf).filter(Boolean)), out = [];
+    for (const e of envs) {
+      const i = info.get(lower(tagOf(e))); if (!i || !i.x) continue;
+      const d = await verify(e, i.x, i.y); if (!d || lower(d.tag) !== lower(i.tag) || !Array.isArray(d.list)) continue;
+      for (const x of d.list) if (x && x.pid) out.push({ ...x, by: d.tag });
+    }
+    return out.sort((a, b) => (b.t || 0) - (a.t || 0));
+  }
+
+  // ---------- changing the password or gamertag, and deleting the account ----------
+  // The code comes from the gamertag and password, so a change is a move: every game's encrypted save is
+  // copied to the new code, then the old one is replaced by a marker that signs out devices still on it.
+  const idFor = async (code) => hex(await sha('id:' + clean(code))).slice(0, 32);
+  const aesFor = async (code) => crypto.subtle.importKey('raw', await sha('key:' + clean(code)), 'AES-GCM', false, ['encrypt', 'decrypt']);
+  async function sealK(k, obj) { const iv = crypto.getRandomValues(new Uint8Array(12)), ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k, te.encode(JSON.stringify(obj)))); const o = new Uint8Array(12 + ct.length); o.set(iv); o.set(ct, 12); return o; }
+  async function openK(k, u) { return JSON.parse(td.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u.slice(0, 12) }, k, u.slice(12)))); }
+  const collectBytes = (filter, ms = 3500) => collectRaw(filter, ms);
+  // every game's save on this account: [{ game, keys }]
+  async function accountDocs(code) {
+    const k = await aesFor(code), out = [];
+    for (const [, b] of await collectBytes(TOPIC + await idFor(code) + '/+')) { try { const d = await openK(k, b); if (d && d.game && d.keys && !d.moved) out.push(d); } catch { /* not ours */ } }
+    return out;
+  }
+  async function retire(code, games) { const k = await aesFor(code), id = await idFor(code), t = Date.now(); for (const g of games) await post(TOPIC + id + '/' + g, await sealK(k, { v: 1, game: g, moved: true, t, keys: {} })); }
+  async function changeAccount(oldCode, newCode, newTag, oldTag) {
+    const docs = await accountDocs(oldCode);
+    if (!docs.some((d) => d.game === 'library')) throw new Error('Couldn’t read your account from the sync relays. Check your connection and try again.');
+    const nk = await aesFor(newCode), nid = await idFor(newCode);
+    for (const d of docs) await post(TOPIC + nid + '/' + d.game, await sealK(nk, d));
+    await claimTag(newTag, newCode);
+    signIn(newCode, newTag, 'join'); // this device moves first, or the marker below would sign it out too
+    await retire(oldCode, docs.map((d) => d.game));
+    if (oldTag && lower(oldTag) !== lower(newTag)) await releaseTag(oldTag);
+    peopleCache.clear();
+    return docs.length;
+  }
+  async function releaseTag(tag) { await Promise.all([post(await tagTopic(tag), ''), post(await proTopic(tag), ''), post(await onTopic(tag), ''), post(MOD + 'rep/' + await short('rep:' + lower(tag)), '')]); }
+  async function deleteAccount(code, tag) {
+    const games = [...new Set(['library', ...(await accountDocs(code)).map((d) => d.game)])];
+    stop();
+    await retire(code, games); await releaseTag(tag); peopleCache.clear();
+  }
+  const pullAll = async () => (acc ? accountDocs(acc.code) : []);
 
   // ---------- UI ----------
   const CSS = `
@@ -233,6 +374,12 @@
 .gs-name{font-size:15px!important;width:60%!important;display:inline-block;margin:0 0 0 6px!important;padding:5px 8px!important;text-transform:none!important}
 .gs-badge{font:800 10px system-ui,sans-serif;font-style:normal;letter-spacing:.08em;padding:1px 6px;border-radius:5px;vertical-align:2px;background:#3b6cf0;color:#fff}.gs-badge.owner{background:#c9a227;color:#1b1a14}
 .gs-ban{font:600 11px system-ui,sans-serif;color:#ff8a80;padding:1px 6px;margin-left:4px;border-radius:5px;border:1px solid #4a4d57;background:#262830;cursor:pointer}
+.gs-pf{display:inline-grid;place-items:center;border-radius:50%;object-fit:cover;vertical-align:middle;margin-right:7px;background:#2c2f38;color:#ddd;font-weight:800;flex:none}
+.gs-who{color:inherit;cursor:pointer;text-decoration:underline dotted #777;text-underline-offset:3px}.gs-who:hover{color:#fff}
+.gs-fr{font-style:normal;color:#ffd65a;margin-left:4px}.gs-rep{color:#c8cad0}
+.gs-person{z-index:2147483001}.gs-hero{margin:-20px -22px 0;height:110px;border-radius:14px 14px 0 0;background:#262a36 center/cover}
+.gs-phead{display:flex;gap:12px;align-items:flex-end;margin:-38px 0 6px}.gs-phead .gs-pf{border:3px solid #17181c;margin:0}.gs-phead h2{margin:0}.gs-phead p{margin:2px 0}
+.gs-games{list-style:none;margin:6px 0;padding:0}.gs-games li{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #2a2c33}.gs-games b{color:#ffd65a}
 .gs-note button{font:600 13px system-ui,sans-serif;padding:6px 10px;border-radius:7px;border:0;background:#3b6cf0;color:#fff;cursor:pointer}`;
   let styled = false;
   const style = () => { if (styled) return; styled = true; const s = document.createElement('style'); s.textContent = CSS; document.head.appendChild(s); };
@@ -310,9 +457,13 @@
     }
     if (acc) {
       deriveFrom(acc.code);
-      for (const k of syncedKeys()) { const v = ls.get(k); if (v != null) { last[k] = v; if (meta[k] === undefined) meta[k] = Date.now(); } }
+      const join = ls.get('gamesync.join'); ls.set('gamesync.join', null); // signed in by the PC app: the account's saves win
+      for (const k of syncedKeys()) { const v = ls.get(k); if (v != null) { last[k] = v; if (join) meta[k] = 0; else if (meta[k] === undefined) meta[k] = Date.now(); } }
       connect();
     }
+    if (acc && acc.tag) setTimeout(() => { ping().catch(() => {}); backfillClaim().catch(() => {}); }, 2500);
+    setInterval(() => { if (acc && acc.tag && !document.hidden) ping().catch(() => {}); }, 120000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden && acc && acc.tag) ping().catch(() => {}); });
     // watch for progress changes (the games write storage directly)
     setInterval(() => { if (!acc || !relay.length) return; const before = JSON.stringify(meta); snapshot(); if (JSON.stringify(meta) !== before) schedulePush(2000); }, 4000);
     document.addEventListener('visibilitychange', () => { if (document.hidden && acc) publish().catch(() => {}); });
@@ -375,6 +526,7 @@
     const clients = await lbConnect();
     const row = { n: myName(), s: score, i: String(info || '').slice(0, 40), t: Date.now() };
     try { const m = await me(); if (m && lower(m.tag) === lower(row.n)) { const sg = await sign(m.k, { m: rowMsg(cfg.game, board, pid(), row) }); row.sig = sg.s; row.sp = sg.p; row.x = m.x; } } catch { /* post unsigned */ }
+    try { const k = await myId(); if (k && lower(acc.tag) === lower(row.n)) row.as = bu(new Uint8Array(await crypto.subtle.sign(SIG, k.key, te.encode(rowMsg(cfg.game, board, pid(), row))))); } catch { /* unsigned */ }
     const body = JSON.stringify(row);
     const topic = LB + cfg.game + '/' + board + '/' + pid();
     const send = (c) => c.publish(topic, body, { qos: 1, retain: true });
@@ -382,17 +534,13 @@
     return true;
   }
   async function lbTop(board, n = 10) {
-    const clients = await lbConnect();
     const topic = LB + cfg.game + '/' + board + '/+', rows = new Map();
-    const checks = Promise.all([staff().catch(() => []), bans().catch(() => new Map())]);
+    const checks = Promise.all([staff().catch(() => []), bans(true).catch(() => new Map())]); // fresh bans: a ban shows the next time anyone opens the board
     const onMsg = (t, msg) => {
-      if (!t.startsWith(LB + cfg.game + '/' + board + '/')) return;
       try { const r = JSON.parse(new TextDecoder().decode(msg)); const s = Number(r.s); if (!Number.isFinite(s) || s <= 0 || s > 1e9) return;
         const who = t.slice(t.lastIndexOf('/') + 1), prev = rows.get(who); if (!prev || s > prev.s) rows.set(who, { n: String(r.n || '?').slice(0, 16), s, i: String(r.i || '').slice(0, 40), me: who === pid(), pid: who, raw: r }); } catch { /* junk */ }
     };
-    for (const c of clients) { c.on('message', onMsg); c.subscribe(topic); }
-    await new Promise((r) => setTimeout(r, 2600));
-    for (const c of clients) { c.unsubscribe(topic); c.removeListener('message', onMsg); }
+    for (const [t, b] of await collectRaw(topic, 2600)) onMsg(t, b);
     const [st, bn] = await checks, out = [];
     for (const r of rows.values()) {
       const who = st.find((p) => lower(p.tag) === lower(r.n));
@@ -402,9 +550,18 @@
         if (!ok) continue; // someone using a staff member's name
         r.badge = who.role;
       }
-      delete r.raw; out.push(r);
+      out.push(r);
     }
-    return out.sort((a, b) => b.s - a.s).slice(0, n);
+    // a gamertag (Name#1234) only shows if that account signed the score; then its picture comes along
+    const tagged = out.filter((r) => r.n.includes('#'));
+    const info = tagged.length ? await people(tagged.map((r) => r.n)).catch(() => new Map()) : new Map();
+    for (const r of tagged) {
+      const i = info.get(lower(r.n));
+      const ok = r.badge || (i && i.x && r.raw.as && await verifyRaw(r.raw.as, rowMsg(cfg.game, board, r.pid, r.raw), i.x, i.y));
+      if (!ok) { r.drop = true; continue; }
+      r.tag = true; r.pf = i && i.profile ? i.profile.pfp : null;
+    }
+    return out.filter((r) => !r.drop).map((r) => { delete r.raw; return r; }).sort((a, b) => b.s - a.s).slice(0, n);
   }
   // The board panel: today's top 10, and a name box (your score is posted once you have a name).
   function board(boardId, title, mine) {
@@ -418,10 +575,12 @@
     w.addEventListener('click', (e) => { if (e.target === w) close(); });
     const draw = (rows, msg) => {
       box.innerHTML = `<h2>🏆 ${escH(title)}</h2>${msg ? `<p class="gs-small">${escH(msg)}</p>` : ''}
-        ${rows ? (rows.length ? `<ol class="gs-lb">${rows.map((r) => `<li class="${r.me ? 'me' : ''}"><span>${escH(r.n)}${r.badge ? ` <em class="gs-badge ${r.badge}">${r.badge === 'owner' ? 'OWNER' : 'MOD'}</em>` : ''}${staffMe && !r.me && !r.badge ? ` <button class="gs-ban" data-ban="${escH(r.pid)}" data-n="${escH(r.n)}" title="Ban from every leaderboard">Ban</button>` : ''}</span><b>${Math.floor(r.s).toLocaleString()}</b>${r.i ? `<small>${escH(r.i)}</small>` : ''}</li>`).join('')}</ol>` : '<p>No scores yet today. Be the first.</p>') : '<p>Loading today’s scores…</p>'}
+        ${rows ? (rows.length ? `<ol class="gs-lb">${rows.map((r) => `<li class="${r.me ? 'me' : ''}"><span>${r.tag ? pfHTML(its, r.pf, r.n, 22) + `<a class="gs-who" data-who="${escH(r.n)}">${escH(r.n)}</a>${isFriend(r.n) ? '<i class="gs-fr" title="Friend">★</i>' : ''}` : escH(r.n)}${r.badge ? ` <em class="gs-badge ${r.badge}">${r.badge === 'owner' ? 'OWNER' : 'MOD'}</em>` : ''}${staffMe && !r.me && !r.badge ? ` <button class="gs-ban" data-ban="${escH(r.pid)}" data-n="${escH(r.n)}" title="Ban from every leaderboard">Ban</button>` : ''}${!staffMe && acc && acc.tag && !r.me && !r.badge ? ` <button class="gs-ban gs-rep" data-rep="${escH(r.pid)}" title="Tell the staff this score looks cheated">Report</button>` : ''}</span><b>${Math.floor(r.s).toLocaleString()}</b>${r.i ? `<small>${escH(r.i)}</small>` : ''}</li>`).join('')}</ol>` : '<p>No scores yet today. Be the first.</p>') : '<p>Loading today’s scores…</p>'}
         ${acc && acc.tag ? `<p class="gs-small">You're on the boards as <b>${escH(myName())}</b> (your Game Library account).</p><div class="gs-row"><button data-a="close">Close</button></div>`
           : `<p class="gs-small">Your name on the boards (every game): <input class="gs-input gs-name" maxlength="16" value="${escH(myName())}" placeholder="Name"></p>
         <div class="gs-row"><button class="gs-main" data-a="save">Save name</button><button data-a="close">Close</button></div>`}`;
+      box.querySelectorAll('[data-who]').forEach((a) => { a.onclick = () => showPerson(a.dataset.who); });
+      box.querySelectorAll('[data-rep]').forEach((b) => { b.onclick = async () => { const r = rows.find((x) => x.pid === b.dataset.rep); if (!r) return; const why = prompt('Report ' + r.n + '’s score of ' + Math.floor(r.s).toLocaleString() + ' to the staff? What looks wrong?', ''); if (why === null) return; b.disabled = true; try { await report(r, cfg.game, boardId, why); b.textContent = 'Reported'; } catch { b.disabled = false; alert('Couldn’t send the report. Check your connection.'); } }; });
       box.querySelectorAll('[data-ban]').forEach((b) => { b.onclick = async () => { const why = prompt('Ban ' + b.dataset.n + ' from every leaderboard? Reason (shown to staff only):', ''); if (why === null) return; try { await setBan('pid:' + b.dataset.ban, true, why, b.dataset.n); await post(LB + cfg.game + '/' + boardId + '/' + b.dataset.ban, ''); load('Banned ' + b.dataset.n + '.'); } catch { load('Couldn’t ban (are you still staff?).'); } }; });
       box.querySelector('[data-a=close]').onclick = close;
       const inp = box.querySelector('.gs-name'); if (!inp) return;
@@ -429,16 +588,60 @@
       inp.addEventListener('keyup', (e) => e.stopPropagation());
       box.querySelector('[data-a=save]').onclick = async () => {
         const v = inp.value.trim().replace(/[^\w .\-'!?#]/g, '').slice(0, 16); if (!v) return;
+        if (v.includes('#')) { load('Names with a # are gamertags. Make an account in the Game Library to use one.'); return; }
         if ((await staff().catch(() => [])).some((p) => lower(p.tag) === lower(v))) { load('That name belongs to a staff member. Pick another.'); return; }
         ls.set('gamesync.name', v);
         if (mine && mine.score > 0) await lbPost(boardId, mine.score, mine.info).catch(() => {});
         load('Saved. Updating…');
       };
     };
-    let staffMe = null;
-    const load = async (msg) => { draw(null, msg); staffMe = await me().catch(() => null); try { const rows = await lbTop(boardId); draw(rows, myName() ? '' : 'Pick a name to put your score on the board.'); } catch { draw([], 'Couldn’t reach the scoreboard. Check your connection.'); } };
+    let staffMe = null, its = [];
+    const load = async (msg) => { draw(null, msg); staffMe = await me().catch(() => null); its = await items(); try { const rows = await lbTop(boardId); draw(rows, myName() ? '' : 'Pick a name to put your score on the board.'); } catch { draw([], 'Couldn’t reach the scoreboard. Check your connection.'); } };
     document.body.appendChild(w);
     (async () => { if (mine && mine.score > 0 && myName()) await lbPost(boardId, mine.score, mine.info).catch(() => {}); load(); })();
+  }
+
+  // ---------- someone's profile card ----------
+  const SITE = 'https://merchantsteam29.github.io/GameLibrary/';
+  let itemsP = null, itemBase = SITE;
+  const items = () => itemsP || (itemsP = fetch(SITE + 'shop/items.json', { cache: 'no-cache' }).then((r) => r.json()).then((j) => j.items || []).catch(() => { itemsP = null; return []; }));
+  const itemFile = (its, id) => { const i = id && its.find((x) => x.id === id); return i ? (/^(https?|file):/.test(i.file) ? i.file : itemBase + i.file) : null; };
+  const pfHTML = (its, id, tag, px) => { const f = itemFile(its, id); return f ? `<img class="gs-pf" style="width:${px}px;height:${px}px" src="${escH(f)}" alt="">` : `<span class="gs-pf" style="width:${px}px;height:${px}px;font-size:${Math.round(px * 0.45)}px">${escH((tag || '?')[0].toUpperCase())}</span>`; };
+  const since = (t) => { const s = Math.max(0, (Date.now() - t) / 1000); return s < 90 ? 'just now' : s < 3600 ? Math.round(s / 60) + ' min ago' : s < 86400 ? Math.round(s / 3600) + ' h ago' : Math.round(s / 86400) + (s < 172800 ? ' day ago' : ' days ago'); };
+  // what someone is up to: playing a game now, in the library, or when they were last around
+  function statusOf(i) {
+    const o = i && i.on, p = i && i.profile, t = Math.max(o ? o.t || 0 : 0, p ? p.t || 0 : 0);
+    if (o && Date.now() - o.t < 5 * 60000) return { live: true, text: o.game === 'library' ? 'In the Game Library' : 'Playing ' + (o.title || o.game) };
+    return { live: false, text: t ? 'Last seen ' + since(t) : 'Not seen yet' };
+  }
+  async function showPerson(tag) {
+    style();
+    const w = document.createElement('div'); w.className = 'gs-wrap gs-person';
+    const box = document.createElement('div'); box.className = 'gs-box'; w.appendChild(box);
+    const close = () => { w.remove(); removeEventListener('keydown', esc, true); };
+    const esc = (e) => { if (e.key === 'Escape') { e.stopImmediatePropagation(); e.preventDefault(); close(); } };
+    addEventListener('keydown', esc, true);
+    w.addEventListener('click', (e) => { if (e.target === w) close(); });
+    box.innerHTML = `<h2>${escH(tag)}</h2><p>Loading…</p>`; document.body.appendChild(w);
+    const [info, its, st] = await Promise.all([people([tag], true).catch(() => new Map()), items(), staff().catch(() => [])]);
+    const i = info.get(lower(tag));
+    const draw = () => {
+      if (!i || !i.claimed) { box.innerHTML = `<h2>${escH(tag)}</h2><p>There’s no account with that gamertag.</p><div class="gs-row"><button data-a="x">Close</button></div>`; box.querySelector('[data-a=x]').onclick = close; return; }
+      const p = i.profile || {}, sf = st.find((x) => lower(x.tag) === lower(i.tag)), stt = statusOf(i), ban = itemFile(its, p.banner);
+      const mine = acc && acc.tag && lower(acc.tag) === lower(i.tag), fr = isFriend(i.tag);
+      const games = (Array.isArray(p.games) ? p.games : []).filter((g) => g && g.a > 0).slice(0, 12);
+      box.innerHTML = `<div class="gs-hero"${ban ? ` style="background-image:linear-gradient(180deg,rgba(0,0,0,0),rgba(0,0,0,.5)),url('${escH(ban)}')"` : ''}></div>
+        <div class="gs-phead">${pfHTML(its, p.pfp, i.tag, 76)}<div><h2>${escH(i.tag)}${sf ? ` <em class="gs-badge ${sf.role}">${sf.role === 'owner' ? 'OWNER' : 'MOD'}</em>` : ''}</h2>
+          <p class="gs-small"><span class="gs-dot ${stt.live ? 'on' : ''}"></span>${escH(stt.text)}</p></div></div>
+        ${p.ach != null ? `<p>🏆 <b>${Number(p.ach) || 0}</b> achievements</p>` : '<p class="gs-small">This player hasn’t opened the Game Library since profiles came out.</p>'}
+        ${games.length ? `<ul class="gs-games">${games.map((g) => `<li><span>${escH(g.n)}</span><b>${g.a}${g.of ? ' / ' + g.of : ''} 🏆</b></li>`).join('')}</ul>` : ''}
+        <div class="gs-row">${acc && acc.tag && !mine ? `<button data-a="fr" class="${fr ? '' : 'gs-main'}">${fr ? '★ Friends · remove' : '＋ Add friend'}</button>` : ''}<button data-a="x">Close</button></div>
+        ${!acc || !acc.tag ? '<p class="gs-small">Sign in to the Game Library to add friends.</p>' : ''}`;
+      box.querySelector('[data-a=x]').onclick = close;
+      const b = box.querySelector('[data-a=fr]');
+      if (b) b.onclick = () => { setFriends(fr ? friends().filter((x) => lower(x) !== lower(i.tag)) : [...friends(), i.tag]); try { window.dispatchEvent(new Event('gs-friends')); } catch { /* old browser */ } draw(); };
+    };
+    draw();
   }
 
   // ---------- staff: the owner and moderators ----------
@@ -468,14 +671,7 @@
   const lower = (t) => String(t || '').toLowerCase();
   const short = async (t) => hex(await sha(t)).slice(0, 24);
   // every retained message under a topic filter, collected for a moment
-  async function collect(filter, ms = 2600) {
-    const clients = await lbConnect(), got = new Map(), base = filter.replace(/[+#].*$/, '');
-    const on = (t, msg) => { if (t.startsWith(base) && msg && msg.length) got.set(t, td.decode(msg)); };
-    for (const c of clients) { c.on('message', on); c.subscribe(filter, { qos: 1 }); }
-    await new Promise((r) => setTimeout(r, ms));
-    for (const c of clients) { c.unsubscribe(filter); c.removeListener('message', on); }
-    return got;
-  }
+  async function collect(filter, ms = 2600) { const got = new Map(); for (const [t, b] of await collectRaw(filter, ms)) got.set(t, td.decode(b)); return got; }
   const jparse = (t) => { try { return JSON.parse(t); } catch { return null; } };
   const fresh = (box, ms, fn) => { if (!box.p || Date.now() - box.t > ms) { box.t = Date.now(); box.p = fn(); box.p.catch(() => { box.p = null; }); } return box.p; };
   // who is staff: [{ tag, x, y, role }]
@@ -782,5 +978,7 @@
     unlock: (id) => unlock(id), board, postScore: (b, s, i) => lbPost(b, s, i).catch(() => false),
     get account() { return acc ? { tag: acc.tag || null, since: acc.since } : null; }, accountCode, probe, tagTaken, claimTag, signIn, signOut: stop,
     syncNow: () => publish().catch(() => {}), onStatus: (f) => onChange.push(f),
-    staff: { OWNER, list: staff, me, setKey: setStaffKey, clearKey: () => ls.set(STAFFKEY, ''), bans, setBan, addMod, removeMod, news, postNews, gifts, giveGift } };
+    people, showPerson, statusOf, setProfile, ping, friends, setFriends, report, changeAccount, deleteAccount, releaseTag, pullAll,
+    useItems(list, base) { itemsP = Promise.resolve(list || []); itemBase = base || SITE; },
+    staff: { OWNER, reports, list: staff, me, setKey: setStaffKey, clearKey: () => ls.set(STAFFKEY, ''), bans, setBan, addMod, removeMod, news, postNews, gifts, giveGift } };
 })();
