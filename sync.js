@@ -543,7 +543,7 @@
     for (const [t, b] of await collectRaw(topic, 2600)) onMsg(t, b);
     const [st, bn] = await checks, out = [];
     for (const r of rows.values()) {
-      const who = st.find((p) => lower(p.tag) === lower(r.n));
+      const who = st.find((p) => lower(p.tag) === lower(r.n) && p.x === r.raw.x) || st.find((p) => lower(p.tag) === lower(r.n));
       if (!who && banned(bn, r.pid, r.n)) continue; // staff can't be banned off the boards
       if (who) {
         const ok = r.raw.x === who.x && r.raw.sp && (await verify({ p: r.raw.sp, s: r.raw.sig }, who.x, who.y))?.m === rowMsg(cfg.game, board, r.pid, r.raw);
@@ -680,17 +680,41 @@
     if (force) staffBox.p = null;
     return fresh(staffBox, 60000, async () => {
       const list = [{ tag: OWNER.tag, x: OWNER.x, y: OWNER.y, role: 'owner' }];
-      const raw = (await collect(MOD + 'roles', 2200)).get(MOD + 'roles');
-      const doc = raw && await verify(jparse(raw), OWNER.x, OWNER.y);
+      const [oa, raw] = await Promise.all([ownerAcct(), collect(MOD + 'roles', 2200).then((m) => m.get(MOD + 'roles'))]);
+      if (oa) list.push({ tag: OWNER.tag, x: oa.x, y: oa.y, role: 'owner' });
+      const doc = raw && await verifyOwner(jparse(raw));
       for (const m of (doc && doc.mods) || []) if (m && m.tag && m.x && m.y) list.push({ tag: String(m.tag), x: m.x, y: m.y, role: 'mod' });
       return list;
     });
   }
-  // this device's staff key, if it has one that is (still) on the staff list
+  // The owner's account: a record signed with the owner key names the account key of GIGACHAD#8122, so being
+  // signed in as that account is enough (no key to paste). Owner-signed things may be signed by either key.
+  const oaBox = {};
+  function ownerAcct(force) {
+    if (force) oaBox.p = null;
+    return fresh(oaBox, 300000, async () => {
+      const raw = (await collect(MOD + 'owneracct', 2200)).get(MOD + 'owneracct');
+      const d = raw && await verify(jparse(raw), OWNER.x, OWNER.y);
+      return d && d.x && d.y ? { x: d.x, y: d.y } : null;
+    });
+  }
+  async function verifyOwner(env) {
+    const d = await verify(env, OWNER.x, OWNER.y); if (d) return d;
+    if (!env || !env.x || env.x === OWNER.x) return null;
+    let oa = await ownerAcct().catch(() => null);
+    if (!oa || oa.x !== env.x) oa = await ownerAcct(true).catch(() => null); // made since this page loaded?
+    return oa && env.x === oa.x ? verify(env, oa.x, oa.y) : null;
+  }
+  // this device's staff key (if it's still on the staff list), or the owner's own account
   async function me() {
-    const k = await parseKey(ls.get(STAFFKEY)); if (!k) return null;
-    const who = (await staff()).find((p) => p.x === k.x && p.y === k.y);
-    return who ? { ...who, k } : null;
+    const list = await staff(), k = await parseKey(ls.get(STAFFKEY));
+    const who = k && list.find((p) => p.x === k.x && p.y === k.y);
+    if (who) return { ...who, k };
+    if (acc && acc.tag && lower(acc.tag) === lower(OWNER.tag)) {
+      const a = await idKey(acc.code), o = list.find((p) => p.role === 'owner' && p.x === a.x && p.y === a.y);
+      if (o) return { ...o, k: a };
+    }
+    return null;
   }
   async function setStaffKey(code) {
     const k = await parseKey(code); if (!k) return 'That isn’t a staff key.';
@@ -740,10 +764,10 @@
   }
   async function removeMod(tag) { await setMods((await staff(true)).filter((p) => p.role === 'mod' && lower(p.tag) !== lower(tag)).map(({ tag: t, x, y }) => ({ tag: t, x, y }))); }
   // owner: the announcement on the library, and gifts (coins and shop items) to a gamertag
-  async function news() { const raw = (await collect(MOD + 'news', 2200)).get(MOD + 'news'); const d = raw && await verify(jparse(raw), OWNER.x, OWNER.y); return d && d.text ? d : null; }
+  async function news() { const raw = (await collect(MOD + 'news', 2200)).get(MOD + 'news'); const d = raw && await verifyOwner(jparse(raw)); return d && d.text ? d : null; }
   async function postNews(text) { const m = await me(); if (!m || m.role !== 'owner') throw new Error('owner only'); await post(MOD + 'news', text ? JSON.stringify(await sign(m.k, { text: String(text).slice(0, 400), t: Date.now() })) : ''); }
   const giftTopic = async (tag) => MOD + 'gift/' + await short('gift:' + lower(tag));
-  async function gifts(tag) { const t = await giftTopic(tag), raw = (await collect(t, 2200)).get(t); const d = raw && await verify(jparse(raw), OWNER.x, OWNER.y); return d && lower(d.tag) === lower(tag) && Array.isArray(d.gifts) ? d.gifts : []; }
+  async function gifts(tag) { const t = await giftTopic(tag), raw = (await collect(t, 2200)).get(t); const d = raw && await verifyOwner(jparse(raw)); return d && lower(d.tag) === lower(tag) && Array.isArray(d.gifts) ? d.gifts : []; }
   async function giveGift(tag, g) {
     const m = await me(); if (!m || m.role !== 'owner') throw new Error('owner only');
     const list = await gifts(tag); list.push({ id: hex(crypto.getRandomValues(new Uint8Array(6))), coins: Math.round(Number(g.coins) || 0), item: g.item || null, note: String(g.note || '').slice(0, 80), t: Date.now() });
